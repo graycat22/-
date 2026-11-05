@@ -2,9 +2,9 @@
 
 Then:
   pip install -r requirements.txt
-  python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs   # build references from OK images
-  python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs
-  python -m crack_v14.cli --input <images> --out out --ref-dir refs   # refs/ref_back.png, refs/ref_front.png
+  python -m crack_v14.make_ref --ok-dir pos1ok --out refs   # build references from OK images (angle auto-detected)
+  python -m crack_v14.make_ref --ok-dir pos2ok --out refs
+  python -m crack_v14.cli --input <images> --out out --ref-dir refs   # refs/ref_pos1.png, refs/ref_pos2.png
   python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out
 NOTE: reference images are NOT included. geometry.py coordinates are for the 960x660
 reference frame and must be re-drawn on your own reference images.
@@ -29,7 +29,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--ref-dir", default="data/refs", help="ref_back.png / ref_front.png")
+    ap.add_argument("--ref-dir", default="data/refs", help="ref_pos1.png / ref_pos2.png")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
     ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
@@ -38,7 +38,7 @@ def main():
         rp = os.path.join(a.ref_dir, f"ref_{k}.png")
         refs[k] = cv2.imread(rp, 0)
         if refs[k] is None:
-            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_back.png と ref_front.png を置いてください)")
+            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_pos1.png と ref_pos2.png を置いてください)")
     ins = Inspector(refs)
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
@@ -309,7 +309,7 @@ import cv2, numpy as np
 SIZE = (960, 660)  # w, h
 
 GEOM = {
-    "front": dict(   # 正面照明の画角（背面光なし）
+    "pos2": dict(    # U字の内側にネジ筒が見える画角
         ref="s03", y_eval=120, edge_margin=10, min_thick=30,
         opening=[(195, 0), (200, 250), (215, 300), (250, 360), (300, 402), (380, 428), (450, 434),
                  (530, 422), (592, 390), (640, 350), (690, 290), (720, 230), (736, 0)],
@@ -317,7 +317,7 @@ GEOM = {
         rim_ignore=[(430, 400, 520, 460)],          # gate notch at 6 o'clock
         outer=[[(756, 0), (756, 660)], [(154, 0), (154, 660)], [(152, 657), (758, 657)]],
     ),
-    "back": dict(    # 背面光のある画角
+    "pos1": dict(    # U字の脚の上まで見える画角
         ref="s12", y_eval=380, edge_margin=14,
         opening=[(262, 60), (265, 350), (285, 420), (330, 470), (400, 497), (450, 502), (520, 497),
                  (590, 470), (630, 420), (652, 350), (652, 60)],
@@ -513,12 +513,20 @@ class Crossing:
 # ---------------------------------------------------------------- full inspection
 class Inspector:
     def __init__(self, refs, ratio_th=0.35, gap_th=25.0):
-        """refs: {"back": gray_ref, "front": gray_ref}  (camera views, in the 960x660 reference frame).
+        """refs: {"pos1": gray_ref, "pos2": gray_ref}  (camera angles, in the 960x660 reference frame).
 
         Crack types: B = bright crack (light leaking through), D = dark crack line."""
         from .register import Reference
         self.cross = {k: Crossing(k) for k in refs}
         self.refs = {k: Reference(k, g) for k, g in refs.items()}
+        self.shape_mask, self.ref_grad = {}, {}
+        for k, g in refs.items():
+            m = self.cross[k].m
+            ring = cv2.dilate(m["opening"].astype(np.uint8), np.ones((25, 25), np.uint8)).astype(bool) & \
+                   ~cv2.erode(m["opening"].astype(np.uint8), np.ones((25, 25), np.uint8)).astype(bool)
+            self.shape_mask[k] = m["band"] | ring
+            gg = cv2.GaussianBlur(g.astype(np.float32), (0, 0), 2)
+            self.ref_grad[k] = cv2.magnitude(cv2.Sobel(gg, cv2.CV_32F, 1, 0), cv2.Sobel(gg, cv2.CV_32F, 0, 1))
         self.cas = {}
         for k in refs:
             m = self.cross[k].m
@@ -533,35 +541,47 @@ class Inspector:
         h, w = gray.shape
         c = gray[int(h * .1):int(h * .6), int(w * .3):int(w * .7)]
         p10, p90 = np.percentile(c, [10, 90])
-        return "back" if p10 > 0.5 * p90 else "front"   # back-lit: opening almost uniformly bright
+        return "pos1" if p10 > 0.5 * p90 else "pos2"   # (unused for the decision; rough hint only)
+
+    def _shape_score(self, warped, k):
+        """Lighting-independent fit: correlation of edge strength with the reference,
+        measured on the cassette body and rim only (the U opening shows back-light or
+        background depending on lighting, so it is left out)."""
+        def grad(g):
+            g = cv2.GaussianBlur(g.astype(np.float32), (0, 0), 2)
+            return cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+        m = self.shape_mask[k]
+        a, b = grad(warped)[m], self.ref_grad[k][m]
+        a = (a - a.mean()) / (a.std() + 1e-6); b = (b - b.mean()) / (b.std() + 1e-6)
+        return float((a * b).mean())
 
     def classify_and_align(self, gray):
-        """Register to every reference view and keep the one that fits best.
+        """Find the camera angle (which reference view) and align to it.
 
-        Does not rely on where things sit in the raw frame, so a different camera
-        framing / resolution does not flip the view decision."""
+        The view is decided by SHAPE only (edges of body / rim), never by brightness,
+        because either angle may be shot with or without back-light."""
         from .register import register, refine_ecc, features
-        hint = self.classify(gray)
-        # register on a copy about the reference size (large camera images are slow for SIFT)
-        f = min(1.0, 1.3 * max(SIZE) / max(gray.shape))
+        f = min(1.0, 1.3 * max(SIZE) / max(gray.shape))     # register on a reference-sized copy
         small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else gray
         S = np.diag([f, f, 1.0])
         feats = features(small)
-        cands = []
+        best = None
         for k, ref in self.refs.items():
             H, n = register(small, ref, feats=feats)
-            if H is not None:
-                cands.append((n * (1.1 if k == hint else 1.0), k, H, n))
-        if not cands:
-            return hint, None, 0
-        cands.sort(key=lambda c: -c[0])
-        for i, (_, k, H, n) in enumerate(cands):
-            Hf, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
-            # the back-lit reference view must actually show back-light after alignment;
-            # if it does not, this view was a wrong pick -> try the next one
-            if k == "back" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
+            if H is None:
                 continue
-            return k, Hf, n
+            Hf, _ = refine_ecc(gray, ref.gray, H @ S, self.cas[k])
+            # a degenerate fit (input does not cover the reference body) cannot be this angle
+            cover = cv2.warpPerspective(np.ones_like(gray), Hf, SIZE).astype(bool)
+            if n < 8 or cover[self.shape_mask[k]].mean() < 0.85:
+                continue
+            sc = self._shape_score(cv2.warpPerspective(gray, Hf, SIZE), k)
+            if best is None or sc > best[0]:
+                best = (sc, k, Hf, n)
+        if best is None:
+            return None, None, 0
+        _, k, Hf, n = best
+        return k, Hf, n
         return k, Hf, n
 
     def backlit(self, warped, kind):
@@ -574,7 +594,7 @@ class Inspector:
 
     def inspect(self, gray):
         kind, H, n = self.classify_and_align(gray)
-        if H is None:
+        if kind is None or H is None:
             return dict(kind=None, judgment="ERROR", reason="registration failed")
         warped = cv2.warpPerspective(gray, H, SIZE)
         cr = self.cross[kind]
@@ -619,8 +639,8 @@ class Inspector:
 '''
 FILES['crack_v14/make_ref.py'] = r'''"""Build a reference image from your own OK images (e.g. pos1ok) in the existing reference frame.
 
-python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs
-python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs
+python -m crack_v14.make_ref --ok-dir pos1ok --out refs     # angle is detected automatically
+python -m crack_v14.make_ref --ok-dir pos2ok --out refs
 
 How it works
   1. the first OK image is aligned ONCE to the current reference (data/refs/ref_<view>.png)
@@ -648,7 +668,7 @@ def small_of(g):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ok-dir", required=True)
-    ap.add_argument("--view", required=True, choices=["back", "front"], help="back=背面光のある画角, front=正面照明の画角")
+    ap.add_argument("--view", default=None, choices=["pos1", "pos2"], help="省略すると自動判定")
     ap.add_argument("--old-ref-dir", default="data/refs")
     ap.add_argument("--out", default="refs_new")
     ap.add_argument("--max", type=int, default=40, help="use at most this many OK images")
@@ -657,17 +677,19 @@ def main():
     if not files:
         raise SystemExit(f"画像がありません: {a.ok_dir}")
     os.makedirs(a.out, exist_ok=True)
-    m = build_masks(a.view)
-    cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
-
-    old = load_gray(os.path.join(a.old_ref_dir, f"ref_{a.view}.png"))
+    from .inspect_v14 import Inspector
+    from .geometry import GEOM
+    olds = {k: load_gray(os.path.join(a.old_ref_dir, f"ref_{k}.png")) for k in GEOM}
+    ins = Inspector(olds if a.view is None else {a.view: olds[a.view]})
     first = load_gray(files[0])
     fs, S = small_of(first)
-    H0, n0 = register(fs, Reference("old", old))
+    view, H0, n0 = ins.classify_and_align(first)
     if H0 is None:
         raise SystemExit("1枚目のOK画像を今の基準画像に位置合わせできませんでした（別の画像を先頭にしてください）")
-    H0, _ = refine_ecc(first, old, H0 @ S, cas)
-    print(f"{os.path.basename(files[0])}: aligned to old reference (inliers={n0})")
+    a.view = view
+    m = build_masks(view)
+    cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
+    print(f"{os.path.basename(files[0])}: 画角={view} として基準に位置合わせ (inliers={n0})")
 
     # first OK image becomes the anchor; others are matched against it at full quality
     anchor = Reference("anchor", fs)
@@ -732,7 +754,9 @@ def register(gray, ref, ratio=0.75, feats=None):
         return None, len(good)
     src = np.float32([kp[g.queryIdx].pt for g in good])
     dst = np.float32([ref.kp[g.trainIdx].pt for g in good])
-    H, inl = cv2.findHomography(src, dst, cv2.RANSAC, 4.0)
+    cv2.setRNGSeed(0)                                     # same input -> same answer
+    method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)       # robust with few matches (OpenCV >= 4.5)
+    H, inl = cv2.findHomography(src, dst, method, 4.0, maxIters=10000, confidence=0.999)
     return H, int(inl.sum()) if inl is not None else 0
 
 

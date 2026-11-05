@@ -15,7 +15,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--ref-dir", default="data/refs", help="ref_back.png / ref_front.png")
+    ap.add_argument("--ref-dir", default="data/refs", help="ref_pos1.png / ref_pos2.png")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
     ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
@@ -24,7 +24,7 @@ def main():
         rp = os.path.join(a.ref_dir, f"ref_{k}.png")
         refs[k] = cv2.imread(rp, 0)
         if refs[k] is None:
-            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_back.png と ref_front.png を置いてください)")
+            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_pos1.png と ref_pos2.png を置いてください)")
     ins = Inspector(refs)
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))

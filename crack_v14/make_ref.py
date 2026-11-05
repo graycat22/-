@@ -1,7 +1,7 @@
 """Build a reference image from your own OK images (e.g. pos1ok) in the existing reference frame.
 
-python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs
-python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs
+python -m crack_v14.make_ref --ok-dir pos1ok --out refs     # angle is detected automatically
+python -m crack_v14.make_ref --ok-dir pos2ok --out refs
 
 How it works
   1. the first OK image is aligned ONCE to the current reference (data/refs/ref_<view>.png)
@@ -29,7 +29,7 @@ def small_of(g):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ok-dir", required=True)
-    ap.add_argument("--view", required=True, choices=["back", "front"], help="back=背面光のある画角, front=正面照明の画角")
+    ap.add_argument("--view", default=None, choices=["pos1", "pos2"], help="省略すると自動判定")
     ap.add_argument("--old-ref-dir", default="data/refs")
     ap.add_argument("--out", default="refs_new")
     ap.add_argument("--max", type=int, default=40, help="use at most this many OK images")
@@ -38,17 +38,19 @@ def main():
     if not files:
         raise SystemExit(f"画像がありません: {a.ok_dir}")
     os.makedirs(a.out, exist_ok=True)
-    m = build_masks(a.view)
-    cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
-
-    old = load_gray(os.path.join(a.old_ref_dir, f"ref_{a.view}.png"))
+    from .inspect_v14 import Inspector
+    from .geometry import GEOM
+    olds = {k: load_gray(os.path.join(a.old_ref_dir, f"ref_{k}.png")) for k in GEOM}
+    ins = Inspector(olds if a.view is None else {a.view: olds[a.view]})
     first = load_gray(files[0])
     fs, S = small_of(first)
-    H0, n0 = register(fs, Reference("old", old))
+    view, H0, n0 = ins.classify_and_align(first)
     if H0 is None:
         raise SystemExit("1枚目のOK画像を今の基準画像に位置合わせできませんでした（別の画像を先頭にしてください）")
-    H0, _ = refine_ecc(first, old, H0 @ S, cas)
-    print(f"{os.path.basename(files[0])}: aligned to old reference (inliers={n0})")
+    a.view = view
+    m = build_masks(view)
+    cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
+    print(f"{os.path.basename(files[0])}: 画角={view} として基準に位置合わせ (inliers={n0})")
 
     # first OK image becomes the anchor; others are matched against it at full quality
     anchor = Reference("anchor", fs)

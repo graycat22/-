@@ -27,7 +27,9 @@ def register(gray, ref, ratio=0.75, feats=None):
         return None, len(good)
     src = np.float32([kp[g.queryIdx].pt for g in good])
     dst = np.float32([ref.kp[g.trainIdx].pt for g in good])
-    H, inl = cv2.findHomography(src, dst, cv2.RANSAC, 4.0)
+    cv2.setRNGSeed(0)                                     # same input -> same answer
+    method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)       # robust with few matches (OpenCV >= 4.5)
+    H, inl = cv2.findHomography(src, dst, method, 4.0, maxIters=10000, confidence=0.999)
     return H, int(inl.sum()) if inl is not None else 0
 
 

@@ -159,12 +159,20 @@ class Crossing:
 # ---------------------------------------------------------------- full inspection
 class Inspector:
     def __init__(self, refs, ratio_th=0.35, gap_th=25.0):
-        """refs: {"back": gray_ref, "front": gray_ref}  (camera views, in the 960x660 reference frame).
+        """refs: {"pos1": gray_ref, "pos2": gray_ref}  (camera angles, in the 960x660 reference frame).
 
         Crack types: B = bright crack (light leaking through), D = dark crack line."""
         from .register import Reference
         self.cross = {k: Crossing(k) for k in refs}
         self.refs = {k: Reference(k, g) for k, g in refs.items()}
+        self.shape_mask, self.ref_grad = {}, {}
+        for k, g in refs.items():
+            m = self.cross[k].m
+            ring = cv2.dilate(m["opening"].astype(np.uint8), np.ones((25, 25), np.uint8)).astype(bool) & \
+                   ~cv2.erode(m["opening"].astype(np.uint8), np.ones((25, 25), np.uint8)).astype(bool)
+            self.shape_mask[k] = m["band"] | ring
+            gg = cv2.GaussianBlur(g.astype(np.float32), (0, 0), 2)
+            self.ref_grad[k] = cv2.magnitude(cv2.Sobel(gg, cv2.CV_32F, 1, 0), cv2.Sobel(gg, cv2.CV_32F, 0, 1))
         self.cas = {}
         for k in refs:
             m = self.cross[k].m
@@ -179,35 +187,47 @@ class Inspector:
         h, w = gray.shape
         c = gray[int(h * .1):int(h * .6), int(w * .3):int(w * .7)]
         p10, p90 = np.percentile(c, [10, 90])
-        return "back" if p10 > 0.5 * p90 else "front"   # back-lit: opening almost uniformly bright
+        return "pos1" if p10 > 0.5 * p90 else "pos2"   # (unused for the decision; rough hint only)
+
+    def _shape_score(self, warped, k):
+        """Lighting-independent fit: correlation of edge strength with the reference,
+        measured on the cassette body and rim only (the U opening shows back-light or
+        background depending on lighting, so it is left out)."""
+        def grad(g):
+            g = cv2.GaussianBlur(g.astype(np.float32), (0, 0), 2)
+            return cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+        m = self.shape_mask[k]
+        a, b = grad(warped)[m], self.ref_grad[k][m]
+        a = (a - a.mean()) / (a.std() + 1e-6); b = (b - b.mean()) / (b.std() + 1e-6)
+        return float((a * b).mean())
 
     def classify_and_align(self, gray):
-        """Register to every reference view and keep the one that fits best.
+        """Find the camera angle (which reference view) and align to it.
 
-        Does not rely on where things sit in the raw frame, so a different camera
-        framing / resolution does not flip the view decision."""
+        The view is decided by SHAPE only (edges of body / rim), never by brightness,
+        because either angle may be shot with or without back-light."""
         from .register import register, refine_ecc, features
-        hint = self.classify(gray)
-        # register on a copy about the reference size (large camera images are slow for SIFT)
-        f = min(1.0, 1.3 * max(SIZE) / max(gray.shape))
+        f = min(1.0, 1.3 * max(SIZE) / max(gray.shape))     # register on a reference-sized copy
         small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else gray
         S = np.diag([f, f, 1.0])
         feats = features(small)
-        cands = []
+        best = None
         for k, ref in self.refs.items():
             H, n = register(small, ref, feats=feats)
-            if H is not None:
-                cands.append((n * (1.1 if k == hint else 1.0), k, H, n))
-        if not cands:
-            return hint, None, 0
-        cands.sort(key=lambda c: -c[0])
-        for i, (_, k, H, n) in enumerate(cands):
-            Hf, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
-            # the back-lit reference view must actually show back-light after alignment;
-            # if it does not, this view was a wrong pick -> try the next one
-            if k == "back" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
+            if H is None:
                 continue
-            return k, Hf, n
+            Hf, _ = refine_ecc(gray, ref.gray, H @ S, self.cas[k])
+            # a degenerate fit (input does not cover the reference body) cannot be this angle
+            cover = cv2.warpPerspective(np.ones_like(gray), Hf, SIZE).astype(bool)
+            if n < 8 or cover[self.shape_mask[k]].mean() < 0.85:
+                continue
+            sc = self._shape_score(cv2.warpPerspective(gray, Hf, SIZE), k)
+            if best is None or sc > best[0]:
+                best = (sc, k, Hf, n)
+        if best is None:
+            return None, None, 0
+        _, k, Hf, n = best
+        return k, Hf, n
         return k, Hf, n
 
     def backlit(self, warped, kind):
@@ -220,7 +240,7 @@ class Inspector:
 
     def inspect(self, gray):
         kind, H, n = self.classify_and_align(gray)
-        if H is None:
+        if kind is None or H is None:
             return dict(kind=None, judgment="ERROR", reason="registration failed")
         warped = cv2.warpPerspective(gray, H, SIZE)
         cr = self.cross[kind]
