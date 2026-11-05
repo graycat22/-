@@ -191,19 +191,22 @@ class Inspector:
         small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else gray
         S = np.diag([f, f, 1.0])
         feats = features(small)
-        best = None
+        cands = []
         for k, ref in self.refs.items():
             H, n = register(small, ref, feats=feats)
-            if H is None:
-                continue
-            score = n * (1.1 if k == hint else 1.0)            # geometry decides, hint breaks ties
-            if best is None or score > best[0]:
-                best = (score, k, H, n)
-        if best is None:
+            if H is not None:
+                cands.append((n * (1.1 if k == hint else 1.0), k, H, n))
+        if not cands:
             return hint, None, 0
-        _, k, H, n = best
-        H, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
-        return k, H, n
+        cands.sort(key=lambda c: -c[0])
+        for i, (_, k, H, n) in enumerate(cands):
+            Hf, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
+            # the back-lit reference view must actually show back-light after alignment;
+            # if it does not, this view was a wrong pick -> try the next one
+            if k == "B" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
+                continue
+            return k, Hf, n
+        return k, Hf, n
 
     def backlit(self, warped, kind):
         """Is there light behind the part?  Checked inside the U opening after alignment."""

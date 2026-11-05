@@ -46,7 +46,6 @@ def main():
                 (x0, y0), (x1, y1) = p.min(0), p.max(0)
                 if q["ng"]:
                     cv2.polylines(vis, [p], False, col, lw)
-                    cv2.rectangle(vis, (x0 - 4 * lw, y0 - 4 * lw), (x1 + 4 * lw, y1 + 4 * lw), col, max(1, lw // 2))
                 rb = q.get("rim_break")
                 msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
                         + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
