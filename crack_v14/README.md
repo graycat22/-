@@ -45,6 +45,10 @@ BBOX は入力画像の座標に戻して出力している（`results.csv`）�
 - No.16（s08）: U字下からゲートを通って下端まで走る細い線（実物も割れ）。
   MADE IN CHINA 側には同じ位置に成形線があるため、OK画像との差分なしでは区別できない。OK画像待ち。
 
+## 動作環境
+Python 3.12 / OpenCV 4.9.0 / numpy 1.26.4 / numba 0.60.0 で動作確認済み（画面写真20枚で判定は同じ結果）。
+scikit-image は不要（最短経路は `geodesic.py` に numba で実装。numba が無ければ純Pythonで動く）。
+
 ## 実行
 ```
 pip install -r requirements.txt

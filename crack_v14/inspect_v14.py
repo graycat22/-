@@ -5,7 +5,7 @@ almost entirely over crack-like pixels.  score = fraction of *intact* material t
 best path still has to traverse (0 = cut through end to end, ~1 = healthy).
 """
 import cv2, numpy as np
-from skimage.graph import MCP_Geometric
+from .geodesic import MCP
 from .geometry import build_masks, SIZE
 
 # ---------------------------------------------------------------- crack likelihood
@@ -62,7 +62,7 @@ class Crossing:
         walk[:y0 - 80] = False
         self.walk = walk
         base = np.where(walk, 1.0, np.inf)
-        cum0, _ = MCP_Geometric(base, fully_connected=True).find_costs(self.starts)
+        cum0, _ = MCP(base).find_costs(self.starts)
         ends = np.argwhere(self.m["outer"])
         th = cum0[ends[:, 0], ends[:, 1]]
         if min_thick is None:
@@ -126,7 +126,7 @@ class Crossing:
     def run(self, prob):
         prob = np.where(self.edge_zone, 0.0, prob)
         cost = np.where(self.walk, self.eps + (1.0 - prob), np.inf)
-        mcp = MCP_Geometric(cost, fully_connected=True)
+        mcp = MCP(cost)
         cum, _ = mcp.find_costs(self.starts)
         vals = cum[self.ends[:, 0], self.ends[:, 1]]
         ratio = vals / np.maximum(self.thick, 1)
