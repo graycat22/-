@@ -61,8 +61,9 @@ def main():
                 if q["ng"]:
                     cv2.polylines(vis, [p], False, col, lw)
                 rb = q.get("rim_break")
-                msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
-                        + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
+                msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f} in={q['inner_gap']:.0f} out={q['outer_gap']:.0f}"
+                        + (f" rim={rb:.2f}" if rb is not None else "") + (f" reach={q['reach']:.2f}" if "reach" in q else "")
+                        + (" NG" if q["ng"] else ""))
                 (u0, v0), (u1, v1) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
                 rows.append([name, r["kind"], t, i,
                              round(q["ratio"], 3), round(q["max_gap"], 1),
@@ -494,7 +495,26 @@ class Crossing:
             cur = 0.0 if o else cur + s
             gap = max(gap, cur)
         length = step.sum()
-        return dict(ratio=float(ratio[k]), max_gap=float(gap), length=float(length), path=path)
+        cum_len = np.cumsum(step)
+        idx = np.flatnonzero(on)
+        # how far the crack stops short of each end (0 = it really reaches that edge)
+        inner_gap = float(cum_len[idx[0]]) if len(idx) else float(length)
+        outer_gap = float(length - cum_len[idx[-1]]) if len(idx) else float(length)
+        return dict(ratio=float(ratio[k]), max_gap=float(gap), length=float(length), path=path,
+                    inner_gap=inner_gap, outer_gap=outer_gap, prob=prob)
+
+    def reach_inside(self, prob, start_xy, half=3):
+        """Does the crack continue through the rim into the U opening?
+        Fraction of crack-like pixels on the rim normals at the start point (rim -> opening)."""
+        i = int(np.argmin(np.hypot(*(self.rim_pts - start_xy).T)))
+        js = range(max(0, i - half), min(len(self.rim_pts), i + half + 1))
+        d = np.arange(0, self.rim_depth + 1)
+        vals = []
+        for j in js:
+            xy = self.rim_pts[j][None, :] + d[:, None] * self.rim_nrm[j][None, :]
+            x = xy[:, 0].clip(0, prob.shape[1] - 1).astype(int); y = xy[:, 1].clip(0, prob.shape[0] - 1).astype(int)
+            vals.append((prob[y, x] > 0.15).mean())
+        return float(max(vals)) if vals else 0.0, i
 
     def run_multi(self, prob, k=3, ratio_th=0.35, gap_th=25.0, sep=35):
         """Up to k disjoint crossing paths; stops when the next one is no longer crack-like."""
@@ -533,7 +553,9 @@ class Inspector:
             self.cas[k] = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
         self.ratio_th, self.gap_th = ratio_th, gap_th
         self.d_lo, self.d_hi = 0.10, 0.30
-        self.rim_break_th = 0.30      # D contrast (fraction of plate range) -> prob
+        self.rim_break_th = 0.30
+        self.end_gap_inner, self.end_gap_outer = 10.0, 25.0   # px the crack may stop short of each edge
+        self.reach_th = 0.90                                 # B: light must continue into the opening      # D contrast (fraction of plate range) -> prob
 
     @staticmethod
     def classify(gray):
@@ -620,6 +642,20 @@ class Inspector:
             if cr.rim_ignored(ri):
                 q["rim_break"] = 0.0                       # gate notch etc.: fixed rim gap
             q["ng"] = q["cross_ng"] and q["rim_break"] >= self.rim_break_th
+        # definition: the crack runs END TO END -- from the U opening through the wall to the outer edge.
+        #   both ends: the crack itself must reach the inner band and the outer edge (no intact stub left)
+        #   B: the light leak must connect through the rim into the opening (reach_inside)
+        #   D: the rim highlight must be cut where it starts (rim_break, above)
+        for t, cands in res.items():
+            for q in cands:
+                q.setdefault("cross_ng", q["ng"])
+                ends_ok = q["inner_gap"] <= self.end_gap_inner and q["outer_gap"] <= self.end_gap_outer
+                if t == "B":
+                    q["reach"], _ = cr.reach_inside(q["prob"], q["path"][0][::-1].astype(np.float32))
+                    q["ng"] = q["cross_ng"] and ends_ok and q["reach"] >= self.reach_th
+                else:
+                    q["ng"] = q["ng"] and ends_ok
+                q.pop("prob", None)
         # defects in ORIGINAL image coordinates (for comparison with annotations)
         Hinv = np.linalg.inv(H)
         defects = []

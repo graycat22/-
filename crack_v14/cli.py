@@ -47,8 +47,9 @@ def main():
                 if q["ng"]:
                     cv2.polylines(vis, [p], False, col, lw)
                 rb = q.get("rim_break")
-                msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
-                        + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
+                msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f} in={q['inner_gap']:.0f} out={q['outer_gap']:.0f}"
+                        + (f" rim={rb:.2f}" if rb is not None else "") + (f" reach={q['reach']:.2f}" if "reach" in q else "")
+                        + (" NG" if q["ng"] else ""))
                 (u0, v0), (u1, v1) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
                 rows.append([name, r["kind"], t, i,
                              round(q["ratio"], 3), round(q["max_gap"], 1),
