@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--out", default="out")
     ap.add_argument("--ref-dir", default="data/refs", help="ref_B.png / ref_D.png (reference frame)")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
+    ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
     refs = {k: cv2.imread(os.path.join(a.ref_dir, f"ref_{k}.png"), 0) for k in GEOM}
     ins = Inspector(refs)
@@ -37,18 +38,21 @@ def main():
     rows, tiles, summary = [], [], []
     for f in files:
         name = os.path.splitext(os.path.basename(f))[0]
-        r = ins.inspect(cv2.cvtColor(load(f, a.screen), cv2.COLOR_BGR2GRAY))
+        img = load(f, a.screen)
+        r = ins.inspect(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
         if r["judgment"] == "ERROR":
             print(name, "ERROR", r.get("reason")); continue
-        vis = cv2.cvtColor(r["warped"], cv2.COLOR_GRAY2BGR)
+        # draw on the input image itself (not the warped one), so nothing looks tilted
+        vis = cv2.cvtColor(r["warped"], cv2.COLOR_GRAY2BGR) if a.aligned else img.copy()
+        lw = max(2, round(vis.shape[1] / 320))
         msg = f"{name:24s} view={r['kind']} {r['judgment']:2s} {r['detail']:4s}"
         for t, col in (("D", (0, 0, 255)), ("B", (255, 200, 0))):
             for i, q in enumerate(r["res"].get(t, [])):
-                p = q["path"][:, ::-1].astype(np.int32)
+                p = (q["path"][:, ::-1] if a.aligned else q["path_img"]).astype(np.int32)
                 (x0, y0), (x1, y1) = p.min(0), p.max(0)
                 if q["ng"]:
-                    cv2.polylines(vis, [p], False, col, 3)
-                    cv2.rectangle(vis, (x0 - 8, y0 - 8), (x1 + 8, y1 + 8), col, 1)
+                    cv2.polylines(vis, [p], False, col, lw)
+                    cv2.rectangle(vis, (x0 - 4 * lw, y0 - 4 * lw), (x1 + 4 * lw, y1 + 4 * lw), col, max(1, lw // 2))
                 rb = q.get("rim_break")
                 msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
                         + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
@@ -58,9 +62,11 @@ def main():
                              "" if rb is None else round(rb, 3), q["ng"], u0, v0, u1, v1])
         print(msg)
         summary.append([name, r["judgment"], r["detail"], len(r["defects"])])
-        cv2.putText(vis, f"{name} {r['judgment']}", (10, 40), 0, 1.2, (0, 255, 255), 3)
+        cv2.putText(vis, f"{name} {r['judgment']}", (10, 14 * lw), 0, 0.4 * lw, (0, 255, 255), lw)
         cv2.imwrite(os.path.join(a.out, f"{name}.jpg"), vis)
-        tiles.append(cv2.resize(vis, (480, 330)))
+        t = cv2.resize(vis, (480, round(480 * vis.shape[0] / vis.shape[1])))
+        tile = np.zeros((360, 480, 3), np.uint8); tile[:min(360, t.shape[0])] = t[:360]
+        tiles.append(tile)
     if tiles:
         while len(tiles) % 4: tiles.append(np.zeros_like(tiles[0]))
         cv2.imwrite(os.path.join(a.out, "result_grid.jpg"),
