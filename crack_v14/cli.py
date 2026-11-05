@@ -37,9 +37,11 @@ def main():
                 if q["ng"]:
                     cv2.polylines(vis, [p], False, col, 3)
                     cv2.rectangle(vis, (x0 - 8, y0 - 8), (x1 + 8, y1 + 8), col, 1)
-                msg += f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}{' NG' if q['ng'] else ''}"
+                rb = q.get("rim_break")
+                msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
+                        + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
                 rows.append([name, r["kind"], t, i, round(q["ratio"], 3), round(q["max_gap"], 1),
-                             q["ng"], x0, y0, x1, y1])
+                             "" if rb is None else round(rb, 3), q["ng"], x0, y0, x1, y1])
         print(msg)
         cv2.putText(vis, f"{name} {r['judgment']}", (10, 40), 0, 1.2, (0, 255, 255), 3)
         cv2.imwrite(os.path.join(a.out, f"{name}.jpg"), vis)
@@ -50,7 +52,7 @@ def main():
                     np.vstack([np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]))
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["img", "kind", "mode", "rank", "ratio", "max_gap", "ng", "x1", "y1", "x2", "y2"])
+        w.writerow(["img", "kind", "mode", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])
         w.writerows(rows)
 
 if __name__ == "__main__":

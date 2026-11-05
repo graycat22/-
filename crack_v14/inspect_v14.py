@@ -50,10 +50,11 @@ def z_to_prob(z, z0=3.0, z1=8.0):
 
 # ---------------------------------------------------------------- crossing path
 class Crossing:
-    def __init__(self, kind, eps=0.03, min_thick=60, edge_margin=None):
+    def __init__(self, kind, eps=0.03, min_thick=None, edge_margin=None):
         from .geometry import GEOM
         self.kind, self.eps = kind, eps
         self.m = build_masks(kind)
+        self._build_rim(GEOM[kind]["opening"])
         y0 = GEOM[kind]["y_eval"]
         inner = self.m["inner"].copy(); inner[:y0 - 60] = False
         self.starts = np.argwhere(inner)
@@ -64,6 +65,8 @@ class Crossing:
         cum0, _ = MCP_Geometric(base, fully_connected=True).find_costs(self.starts)
         ends = np.argwhere(self.m["outer"])
         th = cum0[ends[:, 0], ends[:, 1]]
+        if min_thick is None:
+            min_thick = GEOM[kind].get("min_thick", 60)
         keep = (ends[:, 0] >= y0) & np.isfinite(th) & (th >= min_thick)
         self.ends, self.thick = ends[keep], th[keep]               # healthy thickness per end
         # plate border: rib / frame edges are strong lines that are not cracks -> no credit there
@@ -76,6 +79,49 @@ class Crossing:
             self.edge_zone = ez
         else:
             self.edge_zone = np.zeros_like(self.m["plate"])
+
+    def _build_rim(self, opening_poly, step=2.0, depth=16):
+        """Dense rim contour + inward sample offsets (rim highlight lies just inside the opening polygon)."""
+        p = np.array(opening_poly, np.float32)
+        seg = [np.linspace(p[i], p[i + 1], max(2, int(np.hypot(*(p[i + 1] - p[i])) / step)), endpoint=False)
+               for i in range(len(p) - 1)]
+        c = np.vstack(seg)
+        t = np.gradient(c, axis=0); t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-6
+        nrm = np.stack([-t[:, 1], t[:, 0]], 1)
+        # orient normals into the opening
+        probe = (c + 4 * nrm).astype(int)
+        probe[:, 0] = probe[:, 0].clip(0, self.m["opening"].shape[1] - 1)
+        probe[:, 1] = probe[:, 1].clip(0, self.m["opening"].shape[0] - 1)
+        inside = self.m["opening"][probe[:, 1], probe[:, 0]]
+        nrm[~inside] *= -1
+        self.rim_pts, self.rim_nrm, self.rim_depth = c, nrm, depth
+
+    def rim_profile(self, gray):
+        """max brightness across the rim at each contour position (rim highlight strength)."""
+        d = np.arange(-4, self.rim_depth)
+        xy = self.rim_pts[:, None, :] + d[None, :, None] * self.rim_nrm[:, None, :]
+        x = xy[..., 0].clip(0, gray.shape[1] - 1).astype(np.float32)
+        y = xy[..., 1].clip(0, gray.shape[0] - 1).astype(np.float32)
+        v = cv2.remap(cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32), x, y, cv2.INTER_LINEAR)
+        return np.percentile(v, 85, axis=1), d[np.argmax(v, axis=1)].astype(np.float32)
+
+    def rim_break(self, gray, start_xy, win=10, ctx=60):
+        """1 - (rim strength at crack start) / (rim strength around it).  Real crack cuts the rim."""
+        R, off = self.rim_profile(gray)
+        i = int(np.argmin(np.hypot(*(self.rim_pts - start_xy).T)))
+        lo, hi = max(0, i - win), min(len(R), i + win + 1)
+        a, b = slice(max(0, i - ctx), max(0, i - 2 * win)), slice(i + 2 * win, i + ctx)
+        ref = np.r_[R[a], R[b]]
+        if len(ref) < 5 or len(R[a]) < 3 or len(R[b]) < 3:
+            return 0.0, i
+        drop = 1 - R[lo:hi].min() / (np.median(ref) + 1e-6)          # highlight cut
+        step = abs(np.median(off[a]) - np.median(off[b])) / 6.0          # highlight displaced (6px = full)
+        return float(drop), i          # offset step was too noisy (double rim line)
+
+    def rim_ignored(self, i):
+        from .geometry import GEOM
+        x, y = self.rim_pts[i]
+        return any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in GEOM[self.kind].get("rim_ignore", []))
 
     def run(self, prob):
         prob = np.where(self.edge_zone, 0.0, prob)
@@ -123,7 +169,7 @@ class Inspector:
             self.cas[k] = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
         self.ratio_th, self.gap_th = ratio_th, gap_th
         self.d_lo, self.d_hi = 0.10, 0.30
-        self.d_ratio_on_b = 0.15      # D contrast (fraction of plate range) -> prob
+        self.rim_break_th = 0.30      # D contrast (fraction of plate range) -> prob
 
     @staticmethod
     def classify(gray):
@@ -158,10 +204,15 @@ class Inspector:
             # the dark rim of a B opening is not a separate D crack
             near_b = cv2.dilate((pb > 0.3).astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
             pd = np.where(near_b, 0.0, pd)
-        # D on a back-lit (B-kind) image: the body is in silhouette and full of dark mould
-        # lines, so a D candidate there needs much stronger evidence (TODO: replace by OK-MAD)
-        d_ratio = self.ratio_th if kind == "D" else self.d_ratio_on_b
-        res["D"] = cr.run_multi(pd, ratio_th=d_ratio, gap_th=self.gap_th)
+        res["D"] = cr.run_multi(pd, ratio_th=self.ratio_th, gap_th=self.gap_th)
+        # human rule: a real crack opens the part, so the bright rim highlight is CUT where it
+        # starts.  A scratch / mould line / shadow leaves the rim intact.
+        for q in res["D"]:
+            q["cross_ng"] = q["ng"]
+            q["rim_break"], ri = cr.rim_break(warped, q["path"][0][::-1].astype(np.float32))
+            if cr.rim_ignored(ri):
+                q["rim_break"] = 0.0                       # gate notch etc.: fixed rim gap
+            q["ng"] = q["cross_ng"] and q["rim_break"] >= self.rim_break_th
         types = [t for t in ("B", "D") if t in res and res[t][0]["ng"]]
         judgment = "NG[" + "+".join(types) + "]" if types else "OK"
         return dict(kind=kind, inliers=n, H=H, warped=warped, res=res, judgment=judgment)
