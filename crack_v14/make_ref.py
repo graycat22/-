@@ -2,6 +2,8 @@
 
 python -m crack_v14.make_ref --ok-dir pos1ok --out refs     # angle is detected automatically
 python -m crack_v14.make_ref --ok-dir pos2ok --out refs
+python -m crack_v14.make_ref --ok-dir pos1ok --view pos1 --out refs   # without provisional refs:
+                                                    # the first OK image becomes the reference
 
 How it works
   1. the first OK image is aligned ONCE to the current reference (data/refs/ref_<view>.png)
@@ -33,6 +35,10 @@ def main():
     ap.add_argument("--old-ref-dir", default="data/refs")
     ap.add_argument("--out", default="refs_new")
     ap.add_argument("--max", type=int, default=40, help="use at most this many OK images")
+    ap.add_argument("--bootstrap", action="store_true", help="仮の基準画像を使わず、先頭のOK画像を基準にする")
+    ap.add_argument("--move-geom", type=float, nargs=2, default=(0, 0), metavar=("DX", "DY"),
+                    help="check画像の緑・赤の線を右にDX、下にDY px動かす（960x660座標）")
+    ap.add_argument("--scale-geom", type=float, default=1.0, help="線を中心から何倍に広げるか（例 1.03）")
     a = ap.parse_args()
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.ok_dir, f"*.{e}")))[: a.max]
     if not files:
@@ -40,17 +46,36 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     from .inspect_v14 import Inspector
     from .geometry import GEOM
-    olds = {k: load_gray(os.path.join(a.old_ref_dir, f"ref_{k}.png")) for k in GEOM}
-    ins = Inspector(olds if a.view is None else {a.view: olds[a.view]})
     first = load_gray(files[0])
     fs, S = small_of(first)
-    view, H0, n0 = ins.classify_and_align(first)
-    if H0 is None:
-        raise SystemExit("1枚目のOK画像を今の基準画像に位置合わせできませんでした（別の画像を先頭にしてください）")
+    old_paths = {k: os.path.join(a.old_ref_dir, f"ref_{k}.png") for k in GEOM}
+    have_old = all(os.path.exists(p) for p in old_paths.values()) and not a.bootstrap
+    if have_old:
+        olds = {k: load_gray(p) for k, p in old_paths.items()}
+        ins = Inspector(olds if a.view is None else {a.view: olds[a.view]})
+        view, H0, n0 = ins.classify_and_align(first)
+        if H0 is None:
+            raise SystemExit("1枚目のOK画像を今の基準画像に位置合わせできませんでした（別の画像を先頭にしてください）")
+        print(f"{os.path.basename(files[0])}: 画角={view} として仮の基準画像に位置合わせ (inliers={n0})")
+    else:
+        # no provisional reference: the first OK image itself, resized to the reference frame,
+        # becomes the frame.  geometry.py was drawn on a full-frame view, so it fits roughly;
+        # use --move-geom / --scale-geom after looking at check_<view>.jpg if it is off.
+        if a.view is None:
+            raise SystemExit("仮の基準画像が無いときは --view pos1 / pos2 を指定してください")
+        view = a.view
+        h, w = first.shape
+        H0 = np.diag([SIZE[0] / w, SIZE[1] / h, 1.0])
+        print(f"{os.path.basename(files[0])}: 仮の基準画像なし -> 先頭のOK画像を {SIZE[0]}x{SIZE[1]} に縮小して基準にします")
+    # manual correction: move / scale the inspection lines (green/red) as seen in check_<view>.jpg
+    dx, dy = a.move_geom
+    c = np.array([SIZE[0] / 2, SIZE[1] / 2])
+    sc = a.scale_geom
+    T = np.array([[1 / sc, 0, c[0] - c[0] / sc - dx / sc], [0, 1 / sc, c[1] - c[1] / sc - dy / sc], [0, 0, 1]])
+    H0 = T @ H0
     a.view = view
     m = build_masks(view)
     cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
-    print(f"{os.path.basename(files[0])}: 画角={view} として基準に位置合わせ (inliers={n0})")
 
     # first OK image becomes the anchor; others are matched against it at full quality
     anchor = Reference("anchor", fs)
