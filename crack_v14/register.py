@@ -13,9 +13,12 @@ class Reference:
         m = None if mask is None else (mask.astype(np.uint8) * 255)
         self.kp, self.des = _sift.detectAndCompute(_prep(gray), m)
 
-def register(gray, ref, ratio=0.75):
-    """returns (H img->ref, n_inliers)"""
-    kp, des = _sift.detectAndCompute(_prep(gray), None)
+def features(gray):
+    return _sift.detectAndCompute(_prep(gray), None)
+
+def register(gray, ref, ratio=0.75, feats=None):
+    """returns (H img->ref, n_inliers); pass feats=features(gray) to reuse keypoints"""
+    kp, des = feats if feats is not None else features(gray)
     if des is None or len(kp) < 10:
         return None, 0
     m = cv2.BFMatcher().knnMatch(des, ref.des, k=2)

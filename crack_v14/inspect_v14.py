@@ -180,13 +180,38 @@ class Inspector:
         return "B" if p10 > 0.5 * p90 else "D"     # B: opening almost uniformly bright
 
     def classify_and_align(self, gray):
-        from .register import register, refine_ecc
-        k = self.classify(gray)
-        H, n = register(gray, self.refs[k])
-        if H is None:
-            return k, None, n
-        H, cc = refine_ecc(gray, self.refs[k].gray, H, self.cas[k])
+        """Register to every reference view and keep the one that fits best.
+
+        Does not rely on where things sit in the raw frame, so a different camera
+        framing / resolution does not flip the view decision."""
+        from .register import register, refine_ecc, features
+        hint = self.classify(gray)
+        # register on a copy about the reference size (large camera images are slow for SIFT)
+        f = min(1.0, 1.3 * max(SIZE) / max(gray.shape))
+        small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else gray
+        S = np.diag([f, f, 1.0])
+        feats = features(small)
+        best = None
+        for k, ref in self.refs.items():
+            H, n = register(small, ref, feats=feats)
+            if H is None:
+                continue
+            score = n * (1.1 if k == hint else 1.0)            # geometry decides, hint breaks ties
+            if best is None or score > best[0]:
+                best = (score, k, H, n)
+        if best is None:
+            return hint, None, 0
+        _, k, H, n = best
+        H, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
         return k, H, n
+
+    def backlit(self, warped, kind):
+        """Is there light behind the part?  Checked inside the U opening after alignment."""
+        op = cv2.erode(self.cross[kind].m["opening"].astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+        op[: int(op.shape[0] * 0.15)] = False
+        v = warped[op]
+        top = np.percentile(warped, 99)
+        return bool(len(v) and np.percentile(v, 25) > 0.6 * top)
 
     def inspect(self, gray):
         kind, H, n = self.classify_and_align(gray)
@@ -200,7 +225,8 @@ class Inspector:
         pd = z_to_prob(dark_line_map(warped, band), self.d_lo, self.d_hi)
         # dark-line evidence on every image; light-leak evidence whenever back-light is present
         # (a front-lit view has no light behind the part, so a leak cannot show there)
-        if kind == "B":
+        lit = self.backlit(warped, kind)
+        if lit:
             pb = z_to_prob(bright_gap_map(warped, band), 2.5, 6.0)
             res["B"] = cr.run_multi(pb, ratio_th=self.ratio_th, gap_th=self.gap_th)
             # the dark rim of a bright opening is not a separate dark crack
@@ -229,5 +255,5 @@ class Inspector:
                                         ratio=q["ratio"], max_gap=q["max_gap"], rim_break=q.get("rim_break")))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
         judgment = "NG" if defects else "OK"
-        return dict(kind=kind, inliers=n, H=H, warped=warped, res=res, judgment=judgment,
+        return dict(kind=kind, backlit=lit, inliers=n, H=H, warped=warped, res=res, judgment=judgment,
                     defects=defects, detail="+".join(types))
