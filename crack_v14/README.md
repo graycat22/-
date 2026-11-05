@@ -26,6 +26,25 @@
 5. 横断経路探索。見つけた経路の周囲を消して最大3本まで探す（複数割れ対応）
 6. D 候補は縁取りの途切れ（`rim_break`）を必須にする。B画像上の D 候補は B 開口の暗い縁を除外
 
+## 判定の出し方
+- 最終判定は **OK / NG の1つだけ**。B/D を分けて扱う必要はない。
+- 証拠は2種類を同じ画像で両方見る（1枚に両方あってもよい）
+  - `dark_line` : 暗い割れ線（全画像で評価）
+  - `light_leak`: 割れから背面光が漏れている（背面光が写っている画角でだけ評価。正面照明の画角では光が漏れようがない）
+- `view`（B/D）は「どちらの画角か」＝どの基準画像に位置合わせするか、だけの意味。
+
+## 評価（validation / test）
+```
+python -m crack_v14.cli --input <validation画像フォルダ> --out out_val
+python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out_val --role VALIDATION
+```
+見逃し率・過検出率・位置一致（予測BBOXと正解BBOXの重なり）と、見逃し/過検出/位置ずれの画像名を出す。
+BBOX は入力画像の座標に戻して出力している（`results.csv`）。
+
+## 既知の見逃し
+- No.16（s08）: U字下からゲートを通って下端まで走る細い線（実物も割れ）。
+  MADE IN CHINA 側には同じ位置に成形線があるため、OK画像との差分なしでは区別できない。OK画像待ち。
+
 ## 実行
 ```
 pip install -r requirements.txt

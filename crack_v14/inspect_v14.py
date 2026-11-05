@@ -198,10 +198,12 @@ class Inspector:
         res = {}
         # D-path (dark line) on every image, B-path (bright gap) only where backlight exists
         pd = z_to_prob(dark_line_map(warped, band), self.d_lo, self.d_hi)
+        # dark-line evidence on every image; light-leak evidence whenever back-light is present
+        # (a front-lit view has no light behind the part, so a leak cannot show there)
         if kind == "B":
             pb = z_to_prob(bright_gap_map(warped, band), 2.5, 6.0)
             res["B"] = cr.run_multi(pb, ratio_th=self.ratio_th, gap_th=self.gap_th)
-            # the dark rim of a B opening is not a separate D crack
+            # the dark rim of a bright opening is not a separate dark crack
             near_b = cv2.dilate((pb > 0.3).astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
             pd = np.where(near_b, 0.0, pd)
         res["D"] = cr.run_multi(pd, ratio_th=self.ratio_th, gap_th=self.gap_th)
@@ -213,6 +215,19 @@ class Inspector:
             if cr.rim_ignored(ri):
                 q["rim_break"] = 0.0                       # gate notch etc.: fixed rim gap
             q["ng"] = q["cross_ng"] and q["rim_break"] >= self.rim_break_th
-        types = [t for t in ("B", "D") if t in res and res[t][0]["ng"]]
-        judgment = "NG[" + "+".join(types) + "]" if types else "OK"
-        return dict(kind=kind, inliers=n, H=H, warped=warped, res=res, judgment=judgment)
+        # defects in ORIGINAL image coordinates (for comparison with annotations)
+        Hinv = np.linalg.inv(H)
+        defects = []
+        for t, cands in res.items():
+            for q in cands:
+                pts = cv2.perspectiveTransform(q["path"][:, ::-1].reshape(-1, 1, 2).astype(np.float64), Hinv)
+                q["path_img"] = pts.reshape(-1, 2)
+                if q["ng"]:
+                    (x1, y1), (x2, y2) = q["path_img"].min(0), q["path_img"].max(0)
+                    defects.append(dict(evidence="light_leak" if t == "B" else "dark_line",
+                                        bbox=(int(x1), int(y1), int(x2), int(y2)),
+                                        ratio=q["ratio"], max_gap=q["max_gap"], rim_break=q.get("rim_break")))
+        types = sorted({t for t in res if any(q["ng"] for q in res[t])})
+        judgment = "NG" if defects else "OK"
+        return dict(kind=kind, inliers=n, H=H, warped=warped, res=res, judgment=judgment,
+                    defects=defects, detail="+".join(types))
