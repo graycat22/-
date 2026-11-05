@@ -178,7 +178,7 @@ class Crossing:
 # ---------------------------------------------------------------- full inspection
 class Inspector:
     def __init__(self, refs, ratio_th=0.35, gap_th=25.0):
-        """refs: {"pos1": gray_ref, "pos2": gray_ref}  (camera angles, in the 960x660 reference frame).
+        """refs: {"type1": gray_ref, "type2": gray_ref}  (product types, in the 960x660 reference frame).
 
         Crack types: B = bright crack (light leaking through), D = dark crack line."""
         from .register import Reference
@@ -208,7 +208,7 @@ class Inspector:
         h, w = gray.shape
         c = gray[int(h * .1):int(h * .6), int(w * .3):int(w * .7)]
         p10, p90 = np.percentile(c, [10, 90])
-        return "pos1" if p10 > 0.5 * p90 else "pos2"   # (unused for the decision; rough hint only)
+        return "type1" if p10 > 0.5 * p90 else "type2"   # (unused for the decision; rough hint only)
 
     def _shape_score(self, warped, k):
         """Lighting-independent fit: correlation of edge strength with the reference,

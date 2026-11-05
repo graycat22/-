@@ -1,7 +1,7 @@
 """python -m crack_v14.cli --input DIR --out DIR [--screen]
 
 Writes per-image overlay, a grid of all results, and results.csv
-(img, view, type[B=明るい割れ/D=暗い割れ], rank, ratio, max_gap, rim_break, ng, bbox in input coords)."""
+(img, kind[製品の種類 type1/type2], type[B=明るい割れ/D=暗い割れ], rank, ratio, max_gap, rim_break, ng, bbox in input coords)."""
 import argparse, csv, glob, os, cv2, numpy as np
 from .inspect_v14 import Inspector
 from .geometry import GEOM
@@ -15,16 +15,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--ref-dir", default="data/refs", help="ref_pos1.png / ref_pos2.png")
+    ap.add_argument("--ref-dir", default="data/refs", help="ref_type1.png / ref_type2.png")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
     ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
     refs = {}
     for k in GEOM:
         rp = os.path.join(a.ref_dir, f"ref_{k}.png")
-        refs[k] = cv2.imread(rp, 0)
-        if refs[k] is None:
-            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_pos1.png と ref_pos2.png を置いてください)")
+        g = cv2.imread(rp, 0) if os.path.exists(rp) else None
+        if g is None:
+            print(f"注意: {rp} が無いので、種類 {k} は検査しません")
+        else:
+            refs[k] = g
+    if not refs:
+        raise SystemExit(f"基準画像がありません: --ref-dir {a.ref_dir} に ref_type1.png / ref_type2.png を置いてください")
     ins = Inspector(refs)
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
@@ -38,7 +42,7 @@ def main():
         # draw on the input image itself (not the warped one), so nothing looks tilted
         vis = cv2.cvtColor(r["warped"], cv2.COLOR_GRAY2BGR) if a.aligned else img.copy()
         lw = max(2, round(vis.shape[1] / 320))
-        msg = (f"{name:24s} view={r['kind']} backlit={'Y' if r['backlit'] else 'N'} "
+        msg = (f"{name:24s} kind={r['kind']} backlit={'Y' if r['backlit'] else 'N'} "
                f"inl={r['inliers']:<4d} {r['judgment']:2s} {r['detail']:4s}")
         for t, col in (("D", (0, 0, 255)), ("B", (255, 200, 0))):
             for i, q in enumerate(r["res"].get(t, [])):
@@ -67,7 +71,7 @@ def main():
                     np.vstack([np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]))
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["img", "view", "type", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
+        w.writerow(["img", "kind", "type", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
         w.writerows(rows)
     with open(os.path.join(a.out, "judgments.csv"), "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(["img", "judgment", "evidence", "n_defects"]); w.writerows(summary)

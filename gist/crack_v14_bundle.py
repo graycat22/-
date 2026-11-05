@@ -2,9 +2,9 @@
 
 Then:
   pip install -r requirements.txt
-  python -m crack_v14.make_ref --ok-dir pos1ok --out refs   # build references from OK images (angle auto-detected)
-  python -m crack_v14.make_ref --ok-dir pos2ok --out refs
-  python -m crack_v14.cli --input <images> --out out --ref-dir refs   # refs/ref_pos1.png, refs/ref_pos2.png
+  # 仮の基準画像 ref_type1.png / ref_type2.png を data/refs/ に置く
+  python -m crack_v14.make_ref --ok-dir pos1ok --out refs   # OK画像から基準画像を作る（種類は自動で振り分け）
+  python -m crack_v14.cli --input <images> --out out --ref-dir refs
   python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out
 NOTE: reference images are NOT included. geometry.py coordinates are for the 960x660
 reference frame and must be re-drawn on your own reference images.
@@ -15,7 +15,7 @@ FILES['crack_v14/__init__.py'] = r''''''
 FILES['crack_v14/cli.py'] = r'''"""python -m crack_v14.cli --input DIR --out DIR [--screen]
 
 Writes per-image overlay, a grid of all results, and results.csv
-(img, view, type[B=明るい割れ/D=暗い割れ], rank, ratio, max_gap, rim_break, ng, bbox in input coords)."""
+(img, kind[製品の種類 type1/type2], type[B=明るい割れ/D=暗い割れ], rank, ratio, max_gap, rim_break, ng, bbox in input coords)."""
 import argparse, csv, glob, os, cv2, numpy as np
 from .inspect_v14 import Inspector
 from .geometry import GEOM
@@ -29,16 +29,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--ref-dir", default="data/refs", help="ref_pos1.png / ref_pos2.png")
+    ap.add_argument("--ref-dir", default="data/refs", help="ref_type1.png / ref_type2.png")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
     ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
     refs = {}
     for k in GEOM:
         rp = os.path.join(a.ref_dir, f"ref_{k}.png")
-        refs[k] = cv2.imread(rp, 0)
-        if refs[k] is None:
-            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_pos1.png と ref_pos2.png を置いてください)")
+        g = cv2.imread(rp, 0) if os.path.exists(rp) else None
+        if g is None:
+            print(f"注意: {rp} が無いので、種類 {k} は検査しません")
+        else:
+            refs[k] = g
+    if not refs:
+        raise SystemExit(f"基準画像がありません: --ref-dir {a.ref_dir} に ref_type1.png / ref_type2.png を置いてください")
     ins = Inspector(refs)
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
@@ -52,7 +56,7 @@ def main():
         # draw on the input image itself (not the warped one), so nothing looks tilted
         vis = cv2.cvtColor(r["warped"], cv2.COLOR_GRAY2BGR) if a.aligned else img.copy()
         lw = max(2, round(vis.shape[1] / 320))
-        msg = (f"{name:24s} view={r['kind']} backlit={'Y' if r['backlit'] else 'N'} "
+        msg = (f"{name:24s} kind={r['kind']} backlit={'Y' if r['backlit'] else 'N'} "
                f"inl={r['inliers']:<4d} {r['judgment']:2s} {r['detail']:4s}")
         for t, col in (("D", (0, 0, 255)), ("B", (255, 200, 0))):
             for i, q in enumerate(r["res"].get(t, [])):
@@ -81,7 +85,7 @@ def main():
                     np.vstack([np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]))
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["img", "view", "type", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
+        w.writerow(["img", "kind", "type", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
         w.writerows(rows)
     with open(os.path.join(a.out, "judgments.csv"), "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(["img", "judgment", "evidence", "n_defects"]); w.writerows(summary)
@@ -310,7 +314,7 @@ import cv2, numpy as np
 SIZE = (960, 660)  # w, h
 
 GEOM = {
-    "pos2": dict(    # U字の内側にネジ筒が見える画角
+    "type2": dict(   # 製品の種類2: U字の内側にネジ筒が見える（MADE IN CHINA / eDV 刻印）
         ref="s03", y_eval=120, edge_margin=10, min_thick=30,
         opening=[(195, 0), (200, 250), (215, 300), (250, 360), (300, 402), (380, 428), (450, 434),
                  (530, 422), (592, 390), (640, 350), (690, 290), (720, 230), (736, 0)],
@@ -318,7 +322,7 @@ GEOM = {
         rim_ignore=[(430, 400, 520, 460)],          # gate notch at 6 o'clock
         outer=[[(756, 0), (756, 660)], [(154, 0), (154, 660)], [(152, 657), (758, 657)]],
     ),
-    "pos1": dict(    # U字の脚の上まで見える画角
+    "type1": dict(   # 製品の種類1: U字の脚が上まで長く見える
         ref="s12", y_eval=380, edge_margin=14,
         opening=[(262, 60), (265, 350), (285, 420), (330, 470), (400, 497), (450, 502), (520, 497),
                  (590, 470), (630, 420), (652, 350), (652, 60)],
@@ -533,7 +537,7 @@ class Crossing:
 # ---------------------------------------------------------------- full inspection
 class Inspector:
     def __init__(self, refs, ratio_th=0.35, gap_th=25.0):
-        """refs: {"pos1": gray_ref, "pos2": gray_ref}  (camera angles, in the 960x660 reference frame).
+        """refs: {"type1": gray_ref, "type2": gray_ref}  (product types, in the 960x660 reference frame).
 
         Crack types: B = bright crack (light leaking through), D = dark crack line."""
         from .register import Reference
@@ -563,7 +567,7 @@ class Inspector:
         h, w = gray.shape
         c = gray[int(h * .1):int(h * .6), int(w * .3):int(w * .7)]
         p10, p90 = np.percentile(c, [10, 90])
-        return "pos1" if p10 > 0.5 * p90 else "pos2"   # (unused for the decision; rough hint only)
+        return "type1" if p10 > 0.5 * p90 else "type2"   # (unused for the decision; rough hint only)
 
     def _shape_score(self, warped, k):
         """Lighting-independent fit: correlation of edge strength with the reference,
@@ -673,25 +677,25 @@ class Inspector:
         return dict(kind=kind, backlit=lit, inliers=n, H=H, warped=warped, res=res, judgment=judgment,
                     defects=defects, detail="+".join(types))
 '''
-FILES['crack_v14/make_ref.py'] = r'''"""Build a reference image from your own OK images (e.g. pos1ok) in the existing reference frame.
+FILES['crack_v14/make_ref.py'] = r'''"""OK画像のフォルダから基準画像を作る（製品の種類は1枚ずつ自動で振り分ける）。
 
-python -m crack_v14.make_ref --ok-dir pos1ok --out refs     # angle is detected automatically
-python -m crack_v14.make_ref --ok-dir pos2ok --out refs
-python -m crack_v14.make_ref --ok-dir pos1ok --view pos1 --out refs   # without provisional refs:
-                                                    # the first OK image becomes the reference
+python -m crack_v14.make_ref --ok-dir pos1ok --out refs
 
-How it works
-  1. the first OK image is aligned ONCE to the current reference (data/refs/ref_<view>.png)
-  2. every other OK image is aligned to that first OK image (real-to-real: accurate)
-  3. all of them are warped into the reference frame and the pixel-wise median is taken
-     -> refs_new/ref_<view>.png   (same frame as geometry.py, so geometry needs no redrawing)
-  4. refs_new/check_<view>.jpg shows the geometry on the new reference: check it by eye
-     (green = inner rim band, red = outer edge, blue = area a crack has to cross)
-Also writes ok_median_<view>.png / ok_mad_<view>.png for the OK-deviation model later.
+  1. 各OK画像を仮の基準画像（data/refs/ref_type1.png, ref_type2.png）に位置合わせして、種類を判定
+  2. 種類ごとに、先頭の1枚を軸にして残りをその1枚に位置合わせ（実画像どうしなので正確）
+  3. 基準の座標（geometry.py と同じ 960x660）に揃えて画素ごとの中央値 -> refs/ref_type1.png など
+  4. refs/check_type1.jpg などに検査範囲を重ねて出力（緑=内縁の外側、赤=縦リブ/下端、青=探す範囲）
+  OKの中央値・ばらつき（ok_median_*, ok_mad_*）も保存する。
+
+仮の基準画像が無いときは --kind type1 を付けると、先頭のOK画像を縮小してそのまま基準にする
+（全部その種類とみなす。線がずれたら --move-geom / --scale-geom で調整）。
 """
-import argparse, glob, os, cv2, numpy as np
-from .geometry import SIZE, build_masks
+import argparse, glob, os
+from collections import defaultdict
+import cv2, numpy as np
+from .geometry import SIZE, GEOM, build_masks
 from .register import Reference, register, refine_ecc, features
+
 
 def load_gray(p):
     g = cv2.imread(p, 0)
@@ -699,89 +703,92 @@ def load_gray(p):
         raise SystemExit(f"読めない画像: {p}")
     return g
 
+
 def small_of(g):
     f = min(1.0, 1.3 * max(SIZE) / max(g.shape))
     return (cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else g), np.diag([f, f, 1.0])
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ok-dir", required=True)
-    ap.add_argument("--view", default=None, choices=["pos1", "pos2"], help="省略すると自動判定")
-    ap.add_argument("--old-ref-dir", default="data/refs")
-    ap.add_argument("--out", default="refs_new")
-    ap.add_argument("--max", type=int, default=40, help="use at most this many OK images")
-    ap.add_argument("--bootstrap", action="store_true", help="仮の基準画像を使わず、先頭のOK画像を基準にする")
-    ap.add_argument("--move-geom", type=float, nargs=2, default=(0, 0), metavar=("DX", "DY"),
-                    help="check画像の緑・赤の線を右にDX、下にDY px動かす（960x660座標）")
-    ap.add_argument("--scale-geom", type=float, default=1.0, help="線を中心から何倍に広げるか（例 1.03）")
-    a = ap.parse_args()
-    files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.ok_dir, f"*.{e}")))[: a.max]
-    if not files:
-        raise SystemExit(f"画像がありません: {a.ok_dir}")
-    os.makedirs(a.out, exist_ok=True)
-    from .inspect_v14 import Inspector
-    from .geometry import GEOM
-    first = load_gray(files[0])
-    fs, S = small_of(first)
-    old_paths = {k: os.path.join(a.old_ref_dir, f"ref_{k}.png") for k in GEOM}
-    have_old = all(os.path.exists(p) for p in old_paths.values()) and not a.bootstrap
-    if have_old:
-        olds = {k: load_gray(p) for k, p in old_paths.items()}
-        ins = Inspector(olds if a.view is None else {a.view: olds[a.view]})
-        view, H0, n0 = ins.classify_and_align(first)
-        if H0 is None:
-            raise SystemExit("1枚目のOK画像を今の基準画像に位置合わせできませんでした（別の画像を先頭にしてください）")
-        print(f"{os.path.basename(files[0])}: 画角={view} として仮の基準画像に位置合わせ (inliers={n0})")
-    else:
-        # no provisional reference: the first OK image itself, resized to the reference frame,
-        # becomes the frame.  geometry.py was drawn on a full-frame view, so it fits roughly;
-        # use --move-geom / --scale-geom after looking at check_<view>.jpg if it is off.
-        if a.view is None:
-            raise SystemExit("仮の基準画像が無いときは --view pos1 / pos2 を指定してください")
-        view = a.view
-        h, w = first.shape
-        H0 = np.diag([SIZE[0] / w, SIZE[1] / h, 1.0])
-        print(f"{os.path.basename(files[0])}: 仮の基準画像なし -> 先頭のOK画像を {SIZE[0]}x{SIZE[1]} に縮小して基準にします")
-    # manual correction: move / scale the inspection lines (green/red) as seen in check_<view>.jpg
-    dx, dy = a.move_geom
-    c = np.array([SIZE[0] / 2, SIZE[1] / 2])
-    sc = a.scale_geom
-    T = np.array([[1 / sc, 0, c[0] - c[0] / sc - dx / sc], [0, 1 / sc, c[1] - c[1] / sc - dy / sc], [0, 0, 1]])
-    H0 = T @ H0
-    a.view = view
-    m = build_masks(view)
-    cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
 
-    # first OK image becomes the anchor; others are matched against it at full quality
-    anchor = Reference("anchor", fs)
-    stack = [cv2.warpPerspective(first, H0, SIZE)]
-    for f in files[1:]:
-        g = load_gray(f)
+def build_one(kind, items, out, adjust):
+    """items: [(path, gray, H_to_ref)]  先頭が軸"""
+    m = build_masks(kind)
+    cas = cv2.dilate((m["plate"] | m["opening"]).astype(np.uint8), np.ones((41, 41), np.uint8))
+    p0, g0, H0 = items[0]
+    H0 = adjust @ H0
+    gs0, S0 = small_of(g0)
+    anchor = Reference("anchor", gs0)
+    stack = [cv2.warpPerspective(g0, H0, SIZE)]
+    print(f"[{kind}] 軸: {os.path.basename(p0)}")
+    for p, g, _ in items[1:]:
         gs, Sg = small_of(g)
         H, n = register(gs, anchor, feats=features(gs))
         if H is None or n < 30:
-            print(f"{os.path.basename(f)}: skipped (inliers={n})"); continue
-        Hf = H0 @ np.linalg.inv(S) @ H @ Sg                 # g -> first(small) -> first(full) -> ref
-        Hf, cc = refine_ecc(g, stack[0], Hf, cas)             # polish against the first warped OK
+            print(f"[{kind}] {os.path.basename(p)}: 除外 (inliers={n})"); continue
+        Hf = H0 @ np.linalg.inv(S0) @ H @ Sg
+        Hf, cc = refine_ecc(g, stack[0], Hf, cas)
         stack.append(cv2.warpPerspective(g, Hf, SIZE))
-        print(f"{os.path.basename(f)}: ok (inliers={n}, ecc={cc:.3f})")
     st = np.stack(stack).astype(np.float32)
     med = np.median(st, axis=0)
     mad = np.median(np.abs(st - med), axis=0) * 1.4826
     ref = np.clip(med, 0, 255).astype(np.uint8)
-    cv2.imwrite(os.path.join(a.out, f"ref_{a.view}.png"), ref)
-    cv2.imwrite(os.path.join(a.out, f"ok_median_{a.view}.png"), ref)
-    cv2.imwrite(os.path.join(a.out, f"ok_mad_{a.view}.png"), np.clip(mad * 4, 0, 255).astype(np.uint8))
-    np.save(os.path.join(a.out, f"ok_mad_{a.view}.npy"), mad)
-
+    cv2.imwrite(os.path.join(out, f"ref_{kind}.png"), ref)
+    cv2.imwrite(os.path.join(out, f"ok_median_{kind}.png"), ref)
+    np.save(os.path.join(out, f"ok_mad_{kind}.npy"), mad)
     vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
     over = vis.copy(); over[m["band"]] = (200, 80, 0)
     vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
     vis[m["inner"]] = (0, 220, 0); vis[m["outer"]] = (0, 0, 255)
-    cv2.imwrite(os.path.join(a.out, f"check_{a.view}.jpg"), vis)
-    print(f"\n{len(stack)} 枚から作成 -> {a.out}/ref_{a.view}.png")
-    print(f"{a.out}/check_{a.view}.jpg を見て、緑が U字内縁の縁取りの外側、赤が縦リブ/下端に乗っているか確認してください")
-    print(f"良ければ --ref-dir {a.out} で cli を実行（もう片方の view の ref も同じフォルダに置くこと）")
+    cv2.imwrite(os.path.join(out, f"check_{kind}.jpg"), vis)
+    print(f"[{kind}] {len(stack)} 枚から作成 -> {out}/ref_{kind}.png  （{out}/check_{kind}.jpg で線を確認）")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ok-dir", required=True)
+    ap.add_argument("--out", default="refs")
+    ap.add_argument("--old-ref-dir", default="data/refs", help="仮の基準画像の場所")
+    ap.add_argument("--kind", default=None, choices=sorted(GEOM), help="仮の基準画像なしで作るときの種類")
+    ap.add_argument("--max", type=int, default=40, help="種類ごとに使う最大枚数")
+    ap.add_argument("--move-geom", type=float, nargs=2, default=(0, 0), metavar=("DX", "DY"),
+                    help="check画像の線を右にDX、下にDY px動かす（960x660座標）")
+    ap.add_argument("--scale-geom", type=float, default=1.0, help="線を中心から何倍に広げるか（例 1.03）")
+    a = ap.parse_args()
+    files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.ok_dir, f"*.{e}")))
+    if not files:
+        raise SystemExit(f"画像がありません: {a.ok_dir}")
+    os.makedirs(a.out, exist_ok=True)
+
+    dx, dy = a.move_geom; sc = a.scale_geom; cx, cy = SIZE[0] / 2, SIZE[1] / 2
+    adjust = np.array([[1 / sc, 0, cx - cx / sc - dx / sc], [0, 1 / sc, cy - cy / sc - dy / sc], [0, 0, 1]])
+
+    groups = defaultdict(list)
+    old_paths = {k: os.path.join(a.old_ref_dir, f"ref_{k}.png") for k in GEOM}
+    if a.kind is None:
+        missing = [p for p in old_paths.values() if not os.path.exists(p)]
+        if missing:
+            raise SystemExit(f"仮の基準画像がありません: {missing}\n"
+                             f"  --old-ref-dir で場所を指定するか、--kind type1 などで先頭のOK画像から作ってください")
+        from .inspect_v14 import Inspector
+        ins = Inspector({k: load_gray(p) for k, p in old_paths.items()})
+        for f in files:
+            g = load_gray(f)
+            k, H, n = ins.classify_and_align(g)
+            if H is None:
+                print(f"{os.path.basename(f)}: 位置合わせ失敗のため除外"); continue
+            if len(groups[k]) < a.max:
+                groups[k].append((f, g, H))
+        print("振り分け: " + ", ".join(f"{k}={len(v)}枚" for k, v in sorted(groups.items())))
+    else:
+        for f in files[: a.max]:
+            g = load_gray(f); h, w = g.shape
+            groups[a.kind].append((f, g, np.diag([SIZE[0] / w, SIZE[1] / h, 1.0])))
+        print(f"仮の基準画像なし: 全部 {a.kind} とみなし、先頭のOK画像を {SIZE[0]}x{SIZE[1]} に縮小して基準にします")
+    for k, items in sorted(groups.items()):
+        build_one(k, items, a.out, adjust)
+    for k in GEOM:
+        if k not in groups:
+            print(f"注意: {k} のOK画像がありませんでした（cli には ref_{k}.png も必要。仮の基準画像をコピーしてもよい）")
+
 
 if __name__ == "__main__":
     main()
