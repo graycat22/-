@@ -1,7 +1,7 @@
 """Build a reference image from your own OK images (e.g. pos1ok) in the existing reference frame.
 
-python -m crack_v14.make_ref --ok-dir pos1ok --view B --out refs_new
-python -m crack_v14.make_ref --ok-dir pos2ok --view D --out refs_new
+python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs
+python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs
 
 How it works
   1. the first OK image is aligned ONCE to the current reference (data/refs/ref_<view>.png)
@@ -29,7 +29,7 @@ def small_of(g):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ok-dir", required=True)
-    ap.add_argument("--view", required=True, choices=["B", "D"])
+    ap.add_argument("--view", required=True, choices=["back", "front"], help="back=背面光のある画角, front=正面照明の画角")
     ap.add_argument("--old-ref-dir", default="data/refs")
     ap.add_argument("--out", default="refs_new")
     ap.add_argument("--max", type=int, default=40, help="use at most this many OK images")

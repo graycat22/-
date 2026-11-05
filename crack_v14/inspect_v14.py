@@ -159,7 +159,9 @@ class Crossing:
 # ---------------------------------------------------------------- full inspection
 class Inspector:
     def __init__(self, refs, ratio_th=0.35, gap_th=25.0):
-        """refs: {"B": gray_ref, "D": gray_ref} already in reference frame (960x660)."""
+        """refs: {"back": gray_ref, "front": gray_ref}  (camera views, in the 960x660 reference frame).
+
+        Crack types: B = bright crack (light leaking through), D = dark crack line."""
         from .register import Reference
         self.cross = {k: Crossing(k) for k in refs}
         self.refs = {k: Reference(k, g) for k, g in refs.items()}
@@ -177,7 +179,7 @@ class Inspector:
         h, w = gray.shape
         c = gray[int(h * .1):int(h * .6), int(w * .3):int(w * .7)]
         p10, p90 = np.percentile(c, [10, 90])
-        return "B" if p10 > 0.5 * p90 else "D"     # B: opening almost uniformly bright
+        return "back" if p10 > 0.5 * p90 else "front"   # back-lit: opening almost uniformly bright
 
     def classify_and_align(self, gray):
         """Register to every reference view and keep the one that fits best.
@@ -203,7 +205,7 @@ class Inspector:
             Hf, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
             # the back-lit reference view must actually show back-light after alignment;
             # if it does not, this view was a wrong pick -> try the next one
-            if k == "B" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
+            if k == "back" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
                 continue
             return k, Hf, n
         return k, Hf, n
@@ -253,7 +255,7 @@ class Inspector:
                 q["path_img"] = pts.reshape(-1, 2)
                 if q["ng"]:
                     (x1, y1), (x2, y2) = q["path_img"].min(0), q["path_img"].max(0)
-                    defects.append(dict(evidence="light_leak" if t == "B" else "dark_line",
+                    defects.append(dict(type=t,
                                         bbox=(int(x1), int(y1), int(x2), int(y2)),
                                         ratio=q["ratio"], max_gap=q["max_gap"], rim_break=q.get("rim_break")))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})

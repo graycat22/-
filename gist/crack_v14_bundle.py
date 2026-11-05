@@ -2,9 +2,9 @@
 
 Then:
   pip install -r requirements.txt
-  python -m crack_v14.make_ref --ok-dir pos1ok --view B --out refs   # build references from OK images
-  python -m crack_v14.make_ref --ok-dir pos2ok --view D --out refs
-  python -m crack_v14.cli --input <images> --out out --ref-dir refs   # refs/ref_B.png, refs/ref_D.png
+  python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs   # build references from OK images
+  python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs
+  python -m crack_v14.cli --input <images> --out out --ref-dir refs   # refs/ref_back.png, refs/ref_front.png
   python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out
 NOTE: reference images are NOT included. geometry.py coordinates are for the 960x660
 reference frame and must be re-drawn on your own reference images.
@@ -15,7 +15,7 @@ FILES['crack_v14/__init__.py'] = r''''''
 FILES['crack_v14/cli.py'] = r'''"""python -m crack_v14.cli --input DIR --out DIR [--screen]
 
 Writes per-image overlay, a grid of all results, and results.csv
-(img, kind, mode, rank, ratio, max_gap, ng, bbox in reference frame)."""
+(img, view, type[B=明るい割れ/D=暗い割れ], rank, ratio, max_gap, rim_break, ng, bbox in input coords)."""
 import argparse, csv, glob, os, cv2, numpy as np
 from .inspect_v14 import Inspector
 from .geometry import GEOM
@@ -29,7 +29,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--ref-dir", default="data/refs", help="ref_B.png / ref_D.png (reference frame)")
+    ap.add_argument("--ref-dir", default="data/refs", help="ref_back.png / ref_front.png")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
     ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
@@ -38,7 +38,7 @@ def main():
         rp = os.path.join(a.ref_dir, f"ref_{k}.png")
         refs[k] = cv2.imread(rp, 0)
         if refs[k] is None:
-            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_B.png と ref_D.png を置いてください)")
+            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_back.png と ref_front.png を置いてください)")
     ins = Inspector(refs)
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
@@ -64,7 +64,7 @@ def main():
                 msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
                         + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
                 (u0, v0), (u1, v1) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
-                rows.append([name, r["kind"], "light_leak" if t == "B" else "dark_line", i,
+                rows.append([name, r["kind"], t, i,
                              round(q["ratio"], 3), round(q["max_gap"], 1),
                              "" if rb is None else round(rb, 3), q["ng"], u0, v0, u1, v1])
         print(msg)
@@ -80,7 +80,7 @@ def main():
                     np.vstack([np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]))
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["img", "view", "evidence", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
+        w.writerow(["img", "view", "type", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
         w.writerows(rows)
     with open(os.path.join(a.out, "judgments.csv"), "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(["img", "judgment", "evidence", "n_defects"]); w.writerows(summary)
@@ -309,7 +309,7 @@ import cv2, numpy as np
 SIZE = (960, 660)  # w, h
 
 GEOM = {
-    "D": dict(
+    "front": dict(   # 正面照明の画角（背面光なし）
         ref="s03", y_eval=120, edge_margin=10, min_thick=30,
         opening=[(195, 0), (200, 250), (215, 300), (250, 360), (300, 402), (380, 428), (450, 434),
                  (530, 422), (592, 390), (640, 350), (690, 290), (720, 230), (736, 0)],
@@ -317,7 +317,7 @@ GEOM = {
         rim_ignore=[(430, 400, 520, 460)],          # gate notch at 6 o'clock
         outer=[[(756, 0), (756, 660)], [(154, 0), (154, 660)], [(152, 657), (758, 657)]],
     ),
-    "B": dict(
+    "back": dict(    # 背面光のある画角
         ref="s12", y_eval=380, edge_margin=14,
         opening=[(262, 60), (265, 350), (285, 420), (330, 470), (400, 497), (450, 502), (520, 497),
                  (590, 470), (630, 420), (652, 350), (652, 60)],
@@ -513,7 +513,9 @@ class Crossing:
 # ---------------------------------------------------------------- full inspection
 class Inspector:
     def __init__(self, refs, ratio_th=0.35, gap_th=25.0):
-        """refs: {"B": gray_ref, "D": gray_ref} already in reference frame (960x660)."""
+        """refs: {"back": gray_ref, "front": gray_ref}  (camera views, in the 960x660 reference frame).
+
+        Crack types: B = bright crack (light leaking through), D = dark crack line."""
         from .register import Reference
         self.cross = {k: Crossing(k) for k in refs}
         self.refs = {k: Reference(k, g) for k, g in refs.items()}
@@ -531,7 +533,7 @@ class Inspector:
         h, w = gray.shape
         c = gray[int(h * .1):int(h * .6), int(w * .3):int(w * .7)]
         p10, p90 = np.percentile(c, [10, 90])
-        return "B" if p10 > 0.5 * p90 else "D"     # B: opening almost uniformly bright
+        return "back" if p10 > 0.5 * p90 else "front"   # back-lit: opening almost uniformly bright
 
     def classify_and_align(self, gray):
         """Register to every reference view and keep the one that fits best.
@@ -557,7 +559,7 @@ class Inspector:
             Hf, cc = refine_ecc(gray, self.refs[k].gray, H @ S, self.cas[k])   # full-res input -> ref
             # the back-lit reference view must actually show back-light after alignment;
             # if it does not, this view was a wrong pick -> try the next one
-            if k == "B" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
+            if k == "back" and not self.backlit(cv2.warpPerspective(gray, Hf, SIZE), k) and i + 1 < len(cands):
                 continue
             return k, Hf, n
         return k, Hf, n
@@ -607,7 +609,7 @@ class Inspector:
                 q["path_img"] = pts.reshape(-1, 2)
                 if q["ng"]:
                     (x1, y1), (x2, y2) = q["path_img"].min(0), q["path_img"].max(0)
-                    defects.append(dict(evidence="light_leak" if t == "B" else "dark_line",
+                    defects.append(dict(type=t,
                                         bbox=(int(x1), int(y1), int(x2), int(y2)),
                                         ratio=q["ratio"], max_gap=q["max_gap"], rim_break=q.get("rim_break")))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
@@ -617,8 +619,8 @@ class Inspector:
 '''
 FILES['crack_v14/make_ref.py'] = r'''"""Build a reference image from your own OK images (e.g. pos1ok) in the existing reference frame.
 
-python -m crack_v14.make_ref --ok-dir pos1ok --view B --out refs_new
-python -m crack_v14.make_ref --ok-dir pos2ok --view D --out refs_new
+python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs
+python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs
 
 How it works
   1. the first OK image is aligned ONCE to the current reference (data/refs/ref_<view>.png)
@@ -646,7 +648,7 @@ def small_of(g):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ok-dir", required=True)
-    ap.add_argument("--view", required=True, choices=["B", "D"])
+    ap.add_argument("--view", required=True, choices=["back", "front"], help="back=背面光のある画角, front=正面照明の画角")
     ap.add_argument("--old-ref-dir", default="data/refs")
     ap.add_argument("--out", default="refs_new")
     ap.add_argument("--max", type=int, default=40, help="use at most this many OK images")

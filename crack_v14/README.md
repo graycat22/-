@@ -26,6 +26,11 @@
 5. 横断経路探索。見つけた経路の周囲を消して最大3本まで探す（複数割れ対応）
 6. D 候補は縁取りの途切れ（`rim_break`）を必須にする。B画像上の D 候補は B 開口の暗い縁を除外
 
+## 用語
+- **B** = 明るい割れ（割れ目から背面光が漏れて白く見える）
+- **D** = 暗い割れ（黒い割れ線）
+- 画角（view）は **back**（背面光あり）/ **front**（正面照明）。B/D とは別物。
+
 ## 判定の出し方
 - 最終判定は **OK / NG の1つだけ**。B/D を分けて扱う必要はない。
 - 証拠は2種類を同じ画像で両方見る（1枚に両方あってもよい）
@@ -59,16 +64,16 @@ python -m crack_v14.cli --input data/raw_screen --out out --screen  # 画面撮�
 
 ## 実画像に載せ替えるとき（OK画像から基準を作る）
 ```
-python -m crack_v14.make_ref --ok-dir pos1ok --view B --out refs   # 背面光のある画角
-python -m crack_v14.make_ref --ok-dir pos2ok --view D --out refs   # 正面照明の画角
+python -m crack_v14.make_ref --ok-dir pos1ok --view back  --out refs   # 背面光のある画角
+python -m crack_v14.make_ref --ok-dir pos2ok --view front --out refs   # 正面照明の画角
 python -m crack_v14.cli --input <画像> --out out --ref-dir refs
 ```
 OK画像を今の基準枠（geometry.py と同じ座標系）に位置合わせして中央値画像を作るので、geometry.py は描き直し不要。
-`refs/check_B.jpg` `check_D.jpg` で緑（内縁の外側）と赤（縦リブ・下端）が合っているか目で確認する。
+`refs/check_back.jpg` `check_front.jpg` で緑（内縁の外側）と赤（縦リブ・下端）が合っているか目で確認する。
 OKの中央値・ばらつき（ok_median / ok_mad）も同時に保存する（OK差分モデル用）。
 
 以下は手で描き直す場合:
-- `data/refs/ref_B.png`, `ref_D.png` を実画像の代表1枚ずつに差し替え、
+- `data/refs/ref_back.png`, `ref_front.png` を実画像の代表1枚ずつに差し替え、
   `geometry.py` の座標をその画像上で描き直す（今は画面写真 960x660 の座標）。
 - 画角固定なので位置合わせは小さなずれ補正だけになり、今より安定するはず。
 

@@ -1,7 +1,7 @@
 """python -m crack_v14.cli --input DIR --out DIR [--screen]
 
 Writes per-image overlay, a grid of all results, and results.csv
-(img, kind, mode, rank, ratio, max_gap, ng, bbox in reference frame)."""
+(img, view, type[B=明るい割れ/D=暗い割れ], rank, ratio, max_gap, rim_break, ng, bbox in input coords)."""
 import argparse, csv, glob, os, cv2, numpy as np
 from .inspect_v14 import Inspector
 from .geometry import GEOM
@@ -15,7 +15,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--out", default="out")
-    ap.add_argument("--ref-dir", default="data/refs", help="ref_B.png / ref_D.png (reference frame)")
+    ap.add_argument("--ref-dir", default="data/refs", help="ref_back.png / ref_front.png")
     ap.add_argument("--screen", action="store_true", help="inputs are phone photos of the monitor")
     ap.add_argument("--aligned", action="store_true", help="draw on the image warped to the reference (debug)")
     a = ap.parse_args()
@@ -24,7 +24,7 @@ def main():
         rp = os.path.join(a.ref_dir, f"ref_{k}.png")
         refs[k] = cv2.imread(rp, 0)
         if refs[k] is None:
-            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_B.png と ref_D.png を置いてください)")
+            raise SystemExit(f"基準画像が読めません: {rp}  (--ref-dir に ref_back.png と ref_front.png を置いてください)")
     ins = Inspector(refs)
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
@@ -50,7 +50,7 @@ def main():
                 msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
                         + (f" rim={rb:.2f}" if rb is not None else "") + (" NG" if q["ng"] else ""))
                 (u0, v0), (u1, v1) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
-                rows.append([name, r["kind"], "light_leak" if t == "B" else "dark_line", i,
+                rows.append([name, r["kind"], t, i,
                              round(q["ratio"], 3), round(q["max_gap"], 1),
                              "" if rb is None else round(rb, 3), q["ng"], u0, v0, u1, v1])
         print(msg)
@@ -66,7 +66,7 @@ def main():
                     np.vstack([np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]))
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["img", "view", "evidence", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
+        w.writerow(["img", "view", "type", "rank", "ratio", "max_gap", "rim_break", "ng", "x1", "y1", "x2", "y2"])   # bbox in input-image coords
         w.writerows(rows)
     with open(os.path.join(a.out, "judgments.csv"), "w", newline="") as fh:
         w = csv.writer(fh); w.writerow(["img", "judgment", "evidence", "n_defects"]); w.writerows(summary)
