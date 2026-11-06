@@ -768,6 +768,9 @@ ANGLES = np.deg2rad(np.arange(0, 182, 2))     # 真右 -> 真下 -> 真左（画
 R_STEP = 2.0
 OUT = 50          # 外側を何 px 先までなめらかか調べるか
 W_OUT = 0.8       # 外側の模様の多さの減点の重み
+W_NEAR = 1.0      # U字の当てはめで、大まかに見つけた線から離れることの減点の重み
+W_IN = 0.0        # U字の当てはめで、線の内側が外側より明るいことの重み
+SIZE_BONUS = 0.0   # U字の当てはめで、1px 大きいほど得する点数
 R_BONUS = 0.0     # 1px 外側ほど得する点数
 
 
@@ -939,6 +942,89 @@ def regularize(rim, cx, cy, deg=6, iters=3):
     return np.vstack(out)
 
 
+def u_model(cx, w, cy, ry, sq, n_arc=120, leg_step=6.0):
+    """綺麗なU字の線（左右対称）。左の脚の上 -> 底 -> 右の脚の上 の順の点の並び。
+
+      cx : 左右の中心   w : 脚の間の半分の幅   cy : 脚が終わって底のカーブが始まる高さ
+      ry : カーブの深さ   sq : カーブの角ばり具合（2 = 楕円、大きいほど底が平らで角ばる）
+    """
+    a = np.linspace(np.pi, 0, n_arc)
+    co, si = np.cos(a), np.sin(a)
+    e = 2.0 / sq
+    arc = np.c_[cx + w * np.sign(co) * np.abs(co) ** e, cy + ry * np.abs(si) ** e]
+    ys = np.arange(0, cy, leg_step)
+    left = np.c_[np.full(len(ys), cx - w), ys]
+    right = np.c_[np.full(len(ys), cx + w), ys[::-1]]
+    return np.vstack([left, arc, right])
+
+
+def fit_u_model(frame, rough):
+    """大まかに見つけた線 rough を手がかりに、綺麗なU字の形（u_model）をぴったり当てはめる。
+
+    点数 = 線の上で「内側が明るく外側が暗い」強さ − 外側の模様の多さ − 大まかな線からの離れ具合
+    から少しずつ形を動かして、点数が一番高い形にする。出来上がる線は必ず綺麗なU字になる。
+    """
+    rough = np.asarray(rough, np.float64)
+    img = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 1.5)
+    g = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 1.0)
+    edge = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+    edge = np.clip(edge / (np.percentile(edge, 99) + 1e-6) * 60, 0, 60).astype(np.float32)
+    H, W = frame.shape
+
+    def val(M, q):
+        x = np.clip(q[:, 0], 0, W - 1).astype(np.float32).reshape(1, -1)
+        y = np.clip(q[:, 1], 0, H - 1).astype(np.float32).reshape(1, -1)
+        return cv2.remap(M, x, y, cv2.INTER_LINEAR).ravel()
+
+    def score(p):
+        c = u_model(*p, n_arc=80, leg_step=8.0)
+        c = c[c[:, 1] > 0.15 * H]                                  # 一番上（画像のふち付近）は使わない
+        t = np.gradient(c, axis=0)
+        t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+        n = np.stack([t[:, 1], -t[:, 0]], 1)                       # 左 -> 底 -> 右 の向きなら、これが内側
+        step = np.clip(val(img, c + 3 * n) - val(img, c - 3 * n), 0, 60).mean()
+        out = np.mean([val(edge, c - d * n).mean() for d in (8, 16, 24, 32)])
+        # 線の少し内側（10〜40px）は縁取り・開口部なので、外側の樹脂より明るいはず。
+        # 外側の縦リブに合ってしまったときは、内側が暗い樹脂になるので点数が下がる
+        inner = np.mean([val(img, c + d * n) for d in (10, 20, 30, 40)], axis=0)
+        outer = np.mean([val(img, c - d * n) for d in (8, 16, 24, 32)], axis=0)
+        contrast = np.clip(inner - outer, -40, 40).mean()
+        d = np.min(np.hypot(c[:, None, 0] - rough[None, ::3, 0], c[:, None, 1] - rough[None, ::3, 1]), axis=1)
+        # 同じくらい合うなら、大きい（外側の）U字を選ぶ。内側のネジ筒などに吸い付かないように
+        return (step - W_OUT * out + W_IN * contrast - W_NEAR * np.minimum(d, 30).mean()
+                + SIZE_BONUS * (p[1] + p[3]))
+
+    # 初期値: 大まかな線から測る
+    cx = (rough[:, 0].min() + rough[:, 0].max()) / 2
+    w = (rough[:, 0].max() - rough[:, 0].min()) / 2
+    bottom = rough[:, 1].max()
+    # 大まかな線が内側の物に引っ張られていることがあるので、大きさ・深さを変えた初期値をいくつか試す
+    best = None
+    for kw in (0.95, 1.0, 1.05):
+        for kr in (0.6, 0.8, 1.0):
+            for dcx in (0,):
+                q = np.array([cx + dcx, w * kw, bottom - kr * w * kw, kr * w * kw, 2.5])
+                if q[2] < 5:
+                    continue
+                sc = score(q)
+                if best is None or sc > best[0]:
+                    best = (sc, q)
+    cur, p = best
+    for st in (8.0, 3.0, 1.0):
+        improved = True
+        while improved:
+            improved = False
+            for i, d in ((0, st), (1, st), (2, st), (3, st), (4, st * 0.08)):
+                for sgn in (1, -1):
+                    q = p.copy(); q[i] += sgn * d
+                    if q[4] < 1.6 or q[4] > 6 or q[3] < 10 or q[1] < 20:
+                        continue
+                    sc = score(q)
+                    if sc > cur + 1e-6:
+                        p, cur, improved = q, sc, True
+    return p
+
+
 def snap_rim(ref, rim, search=10, step=4.0, smooth_penalty=2.0):
     """縁取りの線を、近くの本当の境目（外側の暗い樹脂 -> 内側の明るい縁取り）に細かく吸い付け、
     縁取りの太さも測る。戻り値: (点の並び, 縁取りの太さ[px])"""
@@ -991,9 +1077,10 @@ def detect_geometry(frame, edge_margin=10, min_thick=30):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
     rim0, (cx, cy), total = find_rim(frame)
-    rim0 = regularize(rim0, cx, cy)                            # 綺麗なU字に直す
-    rim, width = snap_rim(frame, rim0.tolist(), search=5, smooth_penalty=4.0)
-    rim = regularize(np.array(rim), cx, cy).tolist()          # 吸い付けたあとも、もう一度U字にそろえる
+    up = fit_u_model(frame, regularize(rim0, cx, cy))          # 綺麗なU字の形を当てはめる
+    rim = u_model(*up)
+    _, width = snap_rim(frame, rim.tolist(), search=3, smooth_penalty=4.0)   # 縁取りの太さだけ測る
+    rim = rim.tolist()
     rim = np.array(rim)
     bottom = rim[np.argmax(rim[:, 1])]
     top_y = float(rim[:, 1].min())
