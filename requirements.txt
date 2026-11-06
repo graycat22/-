@@ -1,4 +1,4 @@
 # 動作確認済み: Python 3.12 / opencv 4.9.0 / numpy 1.26.4 / numba 0.60.0
-opencv-python>=4.4      # SIFT が本体に入ったのは 4.4 から（headless 版でも可）
+opencv-python>=4.4      # draw_geom の画面表示に必要（headless 版は不可）
 numpy>=1.24
 numba>=0.57             # 無くても動く（最短経路が純Pythonになり遅くなる）

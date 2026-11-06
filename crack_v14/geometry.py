@@ -11,9 +11,8 @@
   edge_margin: プレートの端から何px以内を「割れの証拠にしない」か（リブの縁の黒い線を拾わないため）
   min_thick  : 健全な肉厚がこれより薄い所は検査しない
 
-DEFAULT_GEOM は仮の基準画像（data/refs/ref_type*.png、画面写真から作ったもの）の上で
-手で描いた座標。make_ref で実画像の基準を作ると、実画像に合わせて変換した座標が
-refs/geom_<種類>.json に保存され、検査ではそちらが使われる。
+検査範囲は draw_geom.py で基準画像の上をクリックして作り、refs/geom_<種類>.json に保存する。
+下の DEFAULT_GEOM は、画面写真（テスト用）の上で描いた座標の例。
 """
 import json
 import os
@@ -43,7 +42,6 @@ DEFAULT_GEOM = {
         outer=[[(756, 0), (756, 660)], [(154, 0), (154, 660)], [(152, 657), (758, 657)]],
     ),
 }
-KINDS = sorted(DEFAULT_GEOM)
 
 
 # ------------------------------------------------------------------ 読み書き
@@ -52,45 +50,17 @@ def geom_path(ref_dir, kind):
 
 
 def load_geom(ref_dir, kind):
-    """refs/geom_<種類>.json があればそれを、無ければ DEFAULT_GEOM を返す。"""
-    p = geom_path(ref_dir, kind) if ref_dir else None
-    if p and os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    return json.loads(json.dumps(DEFAULT_GEOM[kind]))   # 深いコピー
+    """refs/geom_<種類>.json を読む。無ければ None。"""
+    p = geom_path(ref_dir, kind)
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def save_geom(ref_dir, kind, g):
     with open(geom_path(ref_dir, kind), "w", encoding="utf-8") as f:
         json.dump(g, f, ensure_ascii=False, indent=1)
-
-
-def transform_geom(g, M):
-    """検査範囲の座標を 3x3 の変換行列 M で写す（仮の基準画像 -> 実画像の基準座標 など）。"""
-    def tp(pts):
-        a = np.array(pts, np.float64).reshape(-1, 1, 2)
-        return [(round(float(x), 1), round(float(y), 1)) for x, y in cv2.perspectiveTransform(a, M).reshape(-1, 2)]
-    def clip(pts):   # 画像の外に出た点は端に寄せる（下端の線が画面外に消えないように）
-        return [(min(max(x, 2.0), SIZE[0] - 3.0), min(max(y, 2.0), SIZE[1] - 3.0)) for x, y in pts]
-    out = dict(g)
-    out["opening"] = tp(g["opening"])
-    out["plate"] = tp(g["plate"])
-    out["outer"] = [clip(tp(line)) for line in g["outer"]]
-    boxes = []
-    for x0, y0, x1, y1 in g.get("rim_ignore", []):
-        (a0, b0), (a1, b1) = tp([(x0, y0), (x1, y1)])
-        boxes.append((min(a0, a1), min(b0, b1), max(a0, a1), max(b0, b1)))
-    out["rim_ignore"] = boxes
-    cx = float(np.mean([p[0] for p in g["plate"]]))
-    out["y_eval"] = int(round(tp([(cx, g["y_eval"])])[0][1]))
-    return out
-
-
-def adjust_matrix(move=(0.0, 0.0), scale=1.0):
-    """線を中心から scale 倍に広げてから (dx, dy) 動かす行列（check画像を見て手で直すとき用）。"""
-    cx, cy = SIZE[0] / 2, SIZE[1] / 2
-    dx, dy = move
-    return np.array([[scale, 0, cx - scale * cx + dx], [0, scale, cy - scale * cy + dy], [0, 0, 1]], np.float64)
 
 
 # ------------------------------------------------------------------ マスク作成

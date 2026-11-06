@@ -2,10 +2,9 @@
 
 展開したあと:
   pip install -r requirements.txt
-  # 仮の基準画像 ref_type1.png / ref_type2.png を data/refs/ に置く
   python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
+  python -m crack_v14.draw_geom --ref-dir refs
   python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
-  python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out
 詳しくは crack_v14/README.md
 """
 import os
@@ -321,6 +320,153 @@ class Crossing:
             p[m.astype(bool)] = 0.0
         return out
 '''
+FILES['crack_v14/draw_geom.py'] = r'''"""基準画像の上でクリックして、検査範囲の線を引くツール。種類ごとに1回だけやる。
+
+使い方:
+  python -m crack_v14.draw_geom --ref-dir refs              # 全部の種類を順番に
+  python -m crack_v14.draw_geom --ref-dir refs --kind type1  # 1つだけ
+
+画面の操作（どの手順でも共通）:
+  左クリック = 点を打つ / 右クリック = 1つ戻す / Enter = 次の手順へ / Esc = やめる
+
+手順:
+  1. U字の縁取りの「外側の線」を、左の脚の上 -> 底 -> 右の脚の上 の順にたどってクリック（15〜25点くらい）
+  2. 左の縦リブの線を、上と下の2点クリック
+  3. 右の縦リブの線を、上と下の2点クリック
+  4. ゲートの切り欠き（6時の位置の、縁取りが最初から切れている所）を囲む四角の、左上と右下をクリック
+     （無ければそのまま Enter）
+  5. 検査を始める高さを1点クリック（これより上の脚の部分は検査しない）
+
+終わると geom_<種類>.json と check_<種類>.jpg（線を重ねた確認画像）が保存される。
+"""
+import argparse
+import glob
+import os
+
+import cv2
+import numpy as np
+
+from .geometry import SIZE, build_masks, save_geom
+
+STEPS = [
+    ("rim", None, "1. U字の縁取りの外側を、左の脚の上 -> 底 -> 右の脚の上 の順にクリック", "1: rim outer edge, left top -> bottom -> right top"),
+    ("lrib", 2, "2. 左の縦リブの線を、上と下の2点クリック", "2: left rib line (top, bottom)"),
+    ("rrib", 2, "3. 右の縦リブの線を、上と下の2点クリック", "3: right rib line (top, bottom)"),
+    ("gate", 2, "4. ゲートの切り欠きを囲む四角の左上と右下をクリック（無ければ Enter）", "4: gate notch box (2 clicks or Enter)"),
+    ("top", 1, "5. 検査を始める高さを1点クリック", "5: inspection top (1 click)"),
+]
+
+
+def geom_from_clicks(rim, lrib, rrib, gate, top, edge_margin=10, min_thick=30):
+    """クリックした点から検査範囲の定義を作る。"""
+    W, H = SIZE
+
+    def line_x_at(p, q, y):          # 2点を通る直線の、高さ y での x
+        (x1, y1), (x2, y2) = p, q
+        return x1 if y2 == y1 else x1 + (x2 - x1) * (y - y1) / (y2 - y1)
+
+    # 縦リブは画像の上から下まで伸ばす
+    l_top, l_bot = (line_x_at(*lrib, 0), 0), (line_x_at(*lrib, H - 1), H - 1)
+    r_top, r_bot = (line_x_at(*rrib, 0), 0), (line_x_at(*rrib, H - 1), H - 1)
+    # 開口部の多角形: クリックした縁取りの線を、両端とも画像の上端まで伸ばして閉じる
+    opening = [(rim[0][0], 0)] + [tuple(p) for p in rim] + [(rim[-1][0], 0)]
+    g = dict(
+        y_eval=int(top[0][1]), edge_margin=edge_margin, min_thick=min_thick,
+        opening=[(float(x), float(y)) for x, y in opening],
+        plate=[l_top, r_top, r_bot, l_bot],
+        rim_ignore=[(min(gate[0][0], gate[1][0]), min(gate[0][1], gate[1][1]),
+                     max(gate[0][0], gate[1][0]), max(gate[0][1], gate[1][1]))] if len(gate) == 2 else [],
+        outer=[[(l_top[0] + 2, 0), (l_bot[0] + 2, H - 1)],          # 左リブの少し内側
+               [(r_top[0] - 2, 0), (r_bot[0] - 2, H - 1)],          # 右リブの少し内側
+               [(l_bot[0], H - 3), (r_bot[0], H - 3)]],             # 画像の下端
+    )
+    return g
+
+
+def draw_check(ref, g):
+    """検査範囲を基準画像に重ねた確認画像（緑 = 起点、赤 = 終点、青 = 探す範囲）。"""
+    m = build_masks(g)
+    vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
+    over = vis.copy()
+    over[m["band"]] = (200, 80, 0)
+    vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
+    vis[m["inner"]] = (0, 220, 0)
+    vis[m["outer"]] = (0, 0, 255)
+    y = g["y_eval"]
+    cv2.line(vis, (0, y), (SIZE[0] - 1, y), (0, 200, 255), 1)      # 検査を始める高さ
+    for x0, y0, x1, y1 in g.get("rim_ignore", []):
+        cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
+    return vis
+
+
+def collect_clicks(ref, kind):
+    """画面に基準画像を出して、手順ごとにクリックを集める。"""
+    pts = {k: [] for k, *_ in STEPS}
+    state = {"i": 0}
+    win = f"draw_geom {kind}"
+
+    def on_mouse(ev, x, y, *_):
+        key, n, *_ = STEPS[state["i"]]
+        if ev == cv2.EVENT_LBUTTONDOWN and (n is None or len(pts[key]) < n):
+            pts[key].append((x, y))
+        elif ev == cv2.EVENT_RBUTTONDOWN and pts[key]:
+            pts[key].pop()
+
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, on_mouse)
+    print(f"\n=== {kind} ===")
+    print("左クリック = 点を打つ / 右クリック = 1つ戻す / Enter = 次へ / Esc = やめる")
+    print(STEPS[0][2])
+    while True:
+        key, n, jp, en = STEPS[state["i"]]
+        vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
+        colors = {"rim": (0, 220, 0), "lrib": (0, 0, 255), "rrib": (0, 0, 255), "gate": (0, 200, 255), "top": (255, 200, 0)}
+        for k, ps in pts.items():
+            for p in ps:
+                cv2.circle(vis, p, 3, colors[k], -1)
+            if len(ps) >= 2 and k != "gate":
+                cv2.polylines(vis, [np.array(ps, np.int32)], False, colors[k], 1)
+        cv2.rectangle(vis, (0, 0), (SIZE[0], 24), (0, 0, 0), -1)
+        cv2.putText(vis, en, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        cv2.imshow(win, vis)
+        k = cv2.waitKey(30) & 0xFF
+        if k == 27:                                   # Esc
+            cv2.destroyWindow(win)
+            return None
+        if k in (13, 10):                             # Enter
+            ok = (len(pts[key]) >= 5) if n is None else (len(pts[key]) == n or key == "gate")
+            if not ok:
+                print("  点が足りません")
+                continue
+            state["i"] += 1
+            if state["i"] == len(STEPS):
+                cv2.destroyWindow(win)
+                return pts
+            print(STEPS[state["i"]][2])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ref-dir", default="refs")
+    ap.add_argument("--kind", default=None, help="線を引く種類（省略すると全部）")
+    a = ap.parse_args()
+    kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[4:-4] for p in glob.glob(os.path.join(a.ref_dir, "ref_*.png")))
+    if not kinds:
+        raise SystemExit(f"基準画像がありません: {a.ref_dir}（先に make_ref を実行してください）")
+    for kind in kinds:
+        ref = cv2.imread(os.path.join(a.ref_dir, f"ref_{kind}.png"), 0)
+        pts = collect_clicks(ref, kind)
+        if pts is None:
+            print("中止しました"); return
+        g = geom_from_clicks(pts["rim"], pts["lrib"], pts["rrib"], pts["gate"], pts["top"])
+        save_geom(a.ref_dir, kind, g)
+        cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
+        print(f"保存しました: {a.ref_dir}/geom_{kind}.json, check_{kind}.jpg")
+
+
+if __name__ == "__main__":
+    main()
+'''
 FILES['crack_v14/evaluate.py'] = r'''"""検査結果を正解CSVと比べて、見逃し・過検出・位置の一致を数える。
 
   python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out [--role VALIDATION]
@@ -605,9 +751,8 @@ FILES['crack_v14/geometry.py'] = r'''"""検査範囲（U字の内縁・外縁・
   edge_margin: プレートの端から何px以内を「割れの証拠にしない」か（リブの縁の黒い線を拾わないため）
   min_thick  : 健全な肉厚がこれより薄い所は検査しない
 
-DEFAULT_GEOM は仮の基準画像（data/refs/ref_type*.png、画面写真から作ったもの）の上で
-手で描いた座標。make_ref で実画像の基準を作ると、実画像に合わせて変換した座標が
-refs/geom_<種類>.json に保存され、検査ではそちらが使われる。
+検査範囲は draw_geom.py で基準画像の上をクリックして作り、refs/geom_<種類>.json に保存する。
+下の DEFAULT_GEOM は、画面写真（テスト用）の上で描いた座標の例。
 """
 import json
 import os
@@ -637,7 +782,6 @@ DEFAULT_GEOM = {
         outer=[[(756, 0), (756, 660)], [(154, 0), (154, 660)], [(152, 657), (758, 657)]],
     ),
 }
-KINDS = sorted(DEFAULT_GEOM)
 
 
 # ------------------------------------------------------------------ 読み書き
@@ -646,45 +790,17 @@ def geom_path(ref_dir, kind):
 
 
 def load_geom(ref_dir, kind):
-    """refs/geom_<種類>.json があればそれを、無ければ DEFAULT_GEOM を返す。"""
-    p = geom_path(ref_dir, kind) if ref_dir else None
-    if p and os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    return json.loads(json.dumps(DEFAULT_GEOM[kind]))   # 深いコピー
+    """refs/geom_<種類>.json を読む。無ければ None。"""
+    p = geom_path(ref_dir, kind)
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def save_geom(ref_dir, kind, g):
     with open(geom_path(ref_dir, kind), "w", encoding="utf-8") as f:
         json.dump(g, f, ensure_ascii=False, indent=1)
-
-
-def transform_geom(g, M):
-    """検査範囲の座標を 3x3 の変換行列 M で写す（仮の基準画像 -> 実画像の基準座標 など）。"""
-    def tp(pts):
-        a = np.array(pts, np.float64).reshape(-1, 1, 2)
-        return [(round(float(x), 1), round(float(y), 1)) for x, y in cv2.perspectiveTransform(a, M).reshape(-1, 2)]
-    def clip(pts):   # 画像の外に出た点は端に寄せる（下端の線が画面外に消えないように）
-        return [(min(max(x, 2.0), SIZE[0] - 3.0), min(max(y, 2.0), SIZE[1] - 3.0)) for x, y in pts]
-    out = dict(g)
-    out["opening"] = tp(g["opening"])
-    out["plate"] = tp(g["plate"])
-    out["outer"] = [clip(tp(line)) for line in g["outer"]]
-    boxes = []
-    for x0, y0, x1, y1 in g.get("rim_ignore", []):
-        (a0, b0), (a1, b1) = tp([(x0, y0), (x1, y1)])
-        boxes.append((min(a0, a1), min(b0, b1), max(a0, a1), max(b0, b1)))
-    out["rim_ignore"] = boxes
-    cx = float(np.mean([p[0] for p in g["plate"]]))
-    out["y_eval"] = int(round(tp([(cx, g["y_eval"])])[0][1]))
-    return out
-
-
-def adjust_matrix(move=(0.0, 0.0), scale=1.0):
-    """線を中心から scale 倍に広げてから (dx, dy) 動かす行列（check画像を見て手で直すとき用）。"""
-    cx, cy = SIZE[0] / 2, SIZE[1] / 2
-    dx, dy = move
-    return np.array([[scale, 0, cx - scale * cx + dx], [0, scale, cy - scale * cy + dy], [0, 0, 1]], np.float64)
 
 
 # ------------------------------------------------------------------ マスク作成
@@ -732,11 +848,12 @@ FILES['crack_v14/inspect_v14.py'] = r'''"""カセットワレ検査 V14 の本�
   5. 経路探索     : 内縁から外縁まで、割れっぽい所だけを通って抜けられるか（crossing.py）
   6. 判定         : 割れの定義「U字の内側から外縁まで、端から端まで割れている」を満たせば NG
 
-基準フォルダ（refs/）の中身（make_ref.py が作る）:
-  ref_<種類>.png      基準画像（OK画像の中央値、基準座標 960x660）
-  geom_<種類>.json    検査範囲の座標
-  info_<種類>.json    基準画像を作ったときのテンプレート位置と画像サイズ
+基準フォルダ（refs/）の中身:
+  ref_<種類>.png      基準画像（OK画像の中央値、基準座標 960x660）     make_ref.py が作る
+  info_<種類>.json    基準画像を作ったときのテンプレート位置と画像サイズ   make_ref.py が作る
+  geom_<種類>.json    検査範囲の座標                                       draw_geom.py で線を引いて作る
 """
+import glob
 import json
 import os
 
@@ -746,7 +863,7 @@ import numpy as np
 from .align import TemplateAligner, frame_matrix, to_frame
 from .crossing import Crossing
 from .features import bright_gap_map, dark_line_map, to_prob
-from .geometry import KINDS, SIZE, load_geom
+from .geometry import SIZE, load_geom
 
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
@@ -800,16 +917,19 @@ class Kind:
 
 
 def load_kinds(ref_dir):
-    """refs/ から使える種類を全部読み込む。"""
+    """refs/ から、基準画像・info・検査範囲の3つが揃っている種類を全部読み込む。"""
     kinds = {}
-    for k in KINDS:
-        rp = os.path.join(ref_dir, f"ref_{k}.png")
+    for rp in sorted(glob.glob(os.path.join(ref_dir, "ref_*.png"))):
+        k = os.path.basename(rp)[4:-4]
         ip = os.path.join(ref_dir, f"info_{k}.json")
-        if not (os.path.exists(rp) and os.path.exists(ip)):
-            continue
+        g = load_geom(ref_dir, k)
+        if not os.path.exists(ip):
+            print(f"注意: {ip} が無いので {k} は検査しません（make_ref で作り直してください）"); continue
+        if g is None:
+            print(f"注意: {k} の検査範囲が無いので {k} は検査しません（draw_geom で線を引いてください）"); continue
         with open(ip, encoding="utf-8") as f:
             info = json.load(f)
-        kinds[k] = Kind(k, cv2.imread(rp, 0), load_geom(ref_dir, k), info["tpl_xy"], info["src_size"])
+        kinds[k] = Kind(k, cv2.imread(rp, 0), g, info["tpl_xy"], info["src_size"])
     return kinds
 
 
@@ -817,8 +937,7 @@ class Inspector:
     def __init__(self, ref_dir, template_gray, params=None):
         self.kinds = load_kinds(ref_dir)
         if not self.kinds:
-            raise SystemExit(f"基準がありません: {ref_dir} に ref_<種類>.png と info_<種類>.json が必要です"
-                             f"（make_ref で作ってください）")
+            raise SystemExit(f"使える基準がありません: {ref_dir}（make_ref と draw_geom を先に実行してください）")
         self.aligner = TemplateAligner(template_gray)
         self.p = dict(PARAMS, **(params or {}))
 
@@ -891,39 +1010,30 @@ class Inspector:
         return dict(kind=kind.name, backlit=lit, template_score=tscore, M=M, frame=frame, res=res,
                     judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))
 '''
-FILES['crack_v14/make_ref.py'] = r'''"""OK画像のフォルダから、検査に使う基準（refs/）を作る。最初の1回だけ実行する。
+FILES['crack_v14/make_ref.py'] = r'''"""OK画像のフォルダから、検査に使う基準画像（refs/）を作る。最初の1回だけ実行する。
 
 使い方:
   python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
+  （このあと python -m crack_v14.draw_geom --ref-dir refs で検査範囲の線を引く）
 
 やること:
-  1. 各OK画像の製品の種類（type1 / type2）を判定する
-     -> 仮の基準画像（data/refs/ref_type*.png、画面写真から作ったもの）と特徴点で照合して決める
-  2. 種類ごとに、先頭のOK画像を「軸」にする
-     -> 仮の基準画像の上で描いてある検査範囲の線を、軸の画像の座標に写して geom_<種類>.json に保存
-        （特徴点の照合 = SIFT を使うのはこの1回だけ。検査のときは使わない）
-  3. 残りのOK画像を、テンプレートマッチングで軸の画像に位置合わせする（検査のときと同じ方法）
-  4. 全部を重ねて、画素ごとの中央値を基準画像 ref_<種類>.png にする
-  5. check_<種類>.jpg に検査範囲を重ねて描く -> 目で確認する
-       緑 = 割れの起点を探す所（U字内縁の縁取りのすぐ外側）
-       赤 = 割れの終点（左右の縦リブと下端）
-       青 = 割れを探す範囲（樹脂の部分）
-
-線がずれていたら --move-geom DX DY（右・下に何px動かすか）と --scale-geom（何倍に広げるか）で直す。
-仮の基準画像が無いときは --kind type1 のように種類を指定すると、DEFAULT の線をそのまま使う。
+  1. 各OK画像で template_table1.png を探し、X・Y のずれを補正して 960x660 に縮小する（検査のときと同じ）
+  2. 輪郭の似ている画像どうしを同じ「製品の種類」にまとめる（type1, type2, ... の順に名前を付ける）
+     すでに refs/ に基準画像があれば、似ている方の名前を引き継ぐ
+  3. 種類ごとに、全部を重ねた画素ごとの中央値を基準画像 ref_<種類>.png にする
+  4. テンプレートの位置などを info_<種類>.json に保存する
 """
 import argparse
 import glob
 import json
 import os
-from collections import defaultdict
 
 import cv2
 import numpy as np
 
 from .align import TemplateAligner, frame_matrix, to_frame
-from .geometry import DEFAULT_GEOM, KINDS, SIZE, adjust_matrix, build_masks, save_geom, transform_geom
-from .inspect_v14 import Kind
+
+GROUP_TH = 0.25   # 輪郭の相関がこれより大きければ同じ種類とみなす
 
 
 def load_gray(p):
@@ -933,25 +1043,17 @@ def load_gray(p):
     return g
 
 
-def classify_with_old_refs(gray, olds):
-    """仮の基準画像と特徴点で照合して、種類と「入力画像 -> 仮の基準画像」の変換を返す。"""
-    from .register import Reference, features, refine_ecc, register
-    f = min(1.0, 1.3 * max(SIZE) / max(gray.shape))         # 大きい画像は縮小してから照合（速さのため）
-    small = cv2.resize(gray, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else gray
-    S = np.diag([f, f, 1.0])
-    feats = features(small)
-    best = None
-    for name, (ref_obj, kind_obj) in olds.items():
-        H, n = register(small, ref_obj, feats=feats)
-        if H is None or n < 8:
-            continue
-        cas = cv2.dilate((kind_obj.cross.m["plate"] | kind_obj.cross.m["opening"]).astype(np.uint8),
-                         np.ones((41, 41), np.uint8))
-        Hf, _ = refine_ecc(gray, kind_obj.ref, H @ S, cas)
-        s = kind_obj.shape_score(cv2.warpPerspective(gray, Hf, SIZE))
-        if best is None or s > best[0]:
-            best = (s, name, Hf)
-    return (None, None) if best is None else (best[1], best[2])
+def edge_signature(frame):
+    """種類の振り分け用: 縮小した画像の輪郭の強さ（平均0・標準偏差1にそろえたもの）。"""
+    g = cv2.resize(frame, (240, 165), interpolation=cv2.INTER_AREA).astype(np.float32)
+    g = cv2.GaussianBlur(g, (0, 0), 1.5)
+    e = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+    return (e - e.mean()) / (e.std() + 1e-6)
+
+
+def similarity(a, b):
+    """2つの輪郭の相関（1 = 同じ、0 = 無関係）。"""
+    return float((a * b).mean())
 
 
 def main():
@@ -959,12 +1061,7 @@ def main():
     ap.add_argument("--ok-dir", required=True, help="OK画像のフォルダ（種類が混ざっていてよい）")
     ap.add_argument("--template", required=True, help="template_table1.png")
     ap.add_argument("--out", default="refs")
-    ap.add_argument("--old-ref-dir", default="data/refs", help="仮の基準画像の場所")
-    ap.add_argument("--kind", default=None, choices=KINDS, help="仮の基準画像なしで作るときの種類")
     ap.add_argument("--max", type=int, default=40, help="種類ごとに使う最大枚数")
-    ap.add_argument("--move-geom", type=float, nargs=2, default=(0, 0), metavar=("DX", "DY"),
-                    help="検査範囲の線を右にDX、下にDY px動かす（960x660座標）")
-    ap.add_argument("--scale-geom", type=float, default=1.0, help="検査範囲の線を中心から何倍に広げるか")
     a = ap.parse_args()
 
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.ok_dir, f"*.{e}")))
@@ -972,147 +1069,59 @@ def main():
         raise SystemExit(f"画像がありません: {a.ok_dir}")
     os.makedirs(a.out, exist_ok=True)
     aligner = TemplateAligner(load_gray(a.template))
-    adjust = adjust_matrix(a.move_geom, a.scale_geom)
 
-    # ---- 1. 種類ごとに振り分け（軸の画像については、仮の基準画像への変換も覚えておく）
-    groups = defaultdict(list)       # 種類 -> [(ファイル名, 画像)]
-    to_old = {}                      # 種類 -> 軸の画像 -> 仮の基準画像 の変換
-    if a.kind is None:
-        from .register import Reference
-        olds = {}
-        for k in KINDS:
-            p = os.path.join(a.old_ref_dir, f"ref_{k}.png")
-            if not os.path.exists(p):
-                raise SystemExit(f"仮の基準画像がありません: {p}\n"
-                                 f"  --old-ref-dir で場所を指定するか、--kind type1 などで作ってください")
-            g = load_gray(p)
-            olds[k] = (Reference(k, g), Kind(k, g, DEFAULT_GEOM[k], (0, 0), g.shape[::-1]))
-        for f in files:
-            g = load_gray(f)
-            k, H = classify_with_old_refs(g, olds)
-            if k is None:
-                print(f"{os.path.basename(f)}: 種類を判定できないので除外"); continue
-            if len(groups[k]) < a.max:
-                if k not in to_old:
-                    to_old[k] = H
-                groups[k].append((f, g))
-        print("振り分け: " + ", ".join(f"{k}={len(v)}枚" for k, v in sorted(groups.items())))
-    else:
-        groups[a.kind] = [(f, load_gray(f)) for f in files[: a.max]]
-        print(f"仮の基準画像なし: 全部 {a.kind} とみなし、検査範囲は DEFAULT の線を使います")
+    # ---- 1. 位置補正。先頭の画像のテンプレート位置を基準にする
+    g0 = load_gray(files[0])
+    tx0, ty0, s0 = aligner.locate(g0)
+    print(f"基準のテンプレート位置: ({tx0:.0f}, {ty0:.0f})  {os.path.basename(files[0])}  一致度 {s0:.2f}")
+    frames = []
+    for f in files:
+        g = load_gray(f)
+        x, y, s = aligner.locate(g)
+        if s < 0.5:
+            print(f"{os.path.basename(f)}: テンプレートが見つからないので除外（一致度 {s:.2f}）"); continue
+        sx, sy = g.shape[1] / g0.shape[1], g.shape[0] / g0.shape[0]
+        fr = to_frame(g, frame_matrix(g.shape, (tx0 * sx - x, ty0 * sy - y)))
+        frames.append((f, fr, edge_signature(fr)))
 
-    # ---- 2〜5. 種類ごとに基準を作る
-    for k, items in sorted(groups.items()):
-        f0, g0 = items[0]
-        F0 = frame_matrix(g0.shape, (0, 0))                     # 軸の画像 -> 基準座標（縮小だけ）
-        if k in to_old:   # 仮の基準画像の線 -> 軸の画像の基準座標
-            geom = transform_geom(DEFAULT_GEOM[k], F0 @ np.linalg.inv(to_old[k]))
-        else:
-            geom = json.loads(json.dumps(DEFAULT_GEOM[k]))
-        geom = transform_geom(geom, adjust)
-        tx0, ty0, s0 = aligner.locate(g0)
-        print(f"[{k}] 軸: {os.path.basename(f0)}（テンプレート一致度 {s0:.2f}）")
+    # ---- 2. 種類ごとにまとめる（すでにある基準画像があれば、その種類から始める）
+    groups = {}                              # 名前 -> {"sigs": [...], "items": [...]}
+    for p in sorted(glob.glob(os.path.join(a.out, "ref_*.png"))):
+        name = os.path.basename(p)[4:-4]
+        groups[name] = dict(sigs=[edge_signature(load_gray(p))], items=[])
+    for f, fr, sig in frames:
+        best, best_s = None, GROUP_TH
+        for name, gr in groups.items():
+            s = max(similarity(sig, t) for t in gr["sigs"])     # その種類の誰かと似ていれば同じ種類
+            if s > best_s:
+                best, best_s = name, s
+        if best is None:
+            best = f"type{len(groups) + 1}"
+            groups[best] = dict(sigs=[], items=[])
+        groups[best]["sigs"].append(sig)
+        if len(groups[best]["items"]) < a.max:
+            groups[best]["items"].append((f, fr))
+    print("振り分け: " + ", ".join(f"{k}={len(v['items'])}枚" for k, v in sorted(groups.items()) if v["items"]))
 
-        stack = [to_frame(g0, F0)]
-        for f, g in items[1:]:
-            x, y, s = aligner.locate(g)
-            if s < 0.5:
-                print(f"[{k}] {os.path.basename(f)}: テンプレートが見つからないので除外（一致度 {s:.2f}）"); continue
-            sx, sy = g.shape[1] / g0.shape[1], g.shape[0] / g0.shape[0]
-            stack.append(to_frame(g, frame_matrix(g.shape, (tx0 * sx - x, ty0 * sy - y))))
-
-        st = np.stack(stack).astype(np.float32)
+    # ---- 3〜4. 種類ごとに中央値をとって保存
+    for name, gr in sorted(groups.items()):
+        if not gr["items"]:
+            continue
+        st = np.stack([fr for _, fr in gr["items"]]).astype(np.float32)
         med = np.median(st, axis=0)
-        mad = np.median(np.abs(st - med), axis=0) * 1.4826   # OK品のばらつき（OK差分モデル用に保存）
-        ref = np.clip(med, 0, 255).astype(np.uint8)
-        cv2.imwrite(os.path.join(a.out, f"ref_{k}.png"), ref)
-        np.save(os.path.join(a.out, f"ok_mad_{k}.npy"), mad)
-        save_geom(a.out, k, geom)
-        with open(os.path.join(a.out, f"info_{k}.json"), "w", encoding="utf-8") as fh:
-            json.dump(dict(tpl_xy=[tx0, ty0], src_size=[g0.shape[1], g0.shape[0]], n_images=len(stack),
-                           anchor=os.path.basename(f0)), fh, ensure_ascii=False, indent=1)
-
-        m = build_masks(geom)
-        vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
-        over = vis.copy(); over[m["band"]] = (200, 80, 0)
-        vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
-        vis[m["inner"]] = (0, 220, 0); vis[m["outer"]] = (0, 0, 255)
-        cv2.imwrite(os.path.join(a.out, f"check_{k}.jpg"), vis)
-        print(f"[{k}] {len(stack)} 枚から作成 -> {a.out}/ref_{k}.png（{a.out}/check_{k}.jpg で線を確認）")
-
-    for k in KINDS:
-        if k not in groups:
-            print(f"注意: {k} のOK画像が無かったので、{k} の基準は作っていません（{k} は検査されません）")
+        mad = np.median(np.abs(st - med), axis=0) * 1.4826     # OK品のばらつき（OK差分モデル用に保存）
+        cv2.imwrite(os.path.join(a.out, f"ref_{name}.png"), np.clip(med, 0, 255).astype(np.uint8))
+        np.save(os.path.join(a.out, f"ok_mad_{name}.npy"), mad)
+        with open(os.path.join(a.out, f"info_{name}.json"), "w", encoding="utf-8") as fh:
+            json.dump(dict(tpl_xy=[tx0, ty0], src_size=[g0.shape[1], g0.shape[0]], n_images=len(gr["items"]),
+                           images=[os.path.basename(f) for f, _ in gr["items"]]), fh, ensure_ascii=False, indent=1)
+        has_geom = os.path.exists(os.path.join(a.out, f"geom_{name}.json"))
+        print(f"[{name}] {len(gr['items'])} 枚から作成 -> {a.out}/ref_{name}.png"
+              + ("" if has_geom else f"   ※ 次に draw_geom で {name} の線を引いてください"))
 
 
 if __name__ == "__main__":
     main()
-'''
-FILES['crack_v14/register.py'] = r'''"""特徴点による照合（SIFT）。make_ref.py で「仮の基準画像の線を実画像に写す」ときだけ使う。
-検査のとき（cli.py / inspect_v14.py）は使わない。
-
-  SIFT       : 画像の中から目印になる点（角や模様）を見つけ、その周りの見た目を数値（特徴量）にする
-  照合       : 2枚の画像で特徴量が似ている点どうしを対応付ける
-  MAGSAC     : 対応の中には間違いが混ざるので、それを捨てながら「どう動かせば重なるか」（ホモグラフィ）を求める
-               （RANSAC の改良版）
-  ECC        : 求めた重ね方を、画像全体の明るさの一致度が上がるように細かく直す
-"""
-import cv2
-import numpy as np
-
-_sift = cv2.SIFT_create(nfeatures=4000)
-
-
-def _prep(gray):
-    # 明るさのムラを均してから特徴点を探す（暗い所にも目印が見つかるように）
-    return cv2.createCLAHE(2.0, (8, 8)).apply(gray)
-
-
-class Reference:
-    """照合の相手になる画像（特徴点を先に計算しておく）。"""
-
-    def __init__(self, name, gray):
-        self.name, self.gray = name, gray
-        self.kp, self.des = _sift.detectAndCompute(_prep(gray), None)
-
-
-def features(gray):
-    """画像の特徴点と特徴量。"""
-    return _sift.detectAndCompute(_prep(gray), None)
-
-
-def register(gray, ref, ratio=0.75, feats=None):
-    """gray を ref に重ねる変換（3x3）と、正しく対応した点の数を返す。失敗したら (None, 点の数)。"""
-    kp, des = feats if feats is not None else features(gray)
-    if des is None or len(kp) < 10:
-        return None, 0
-    m = cv2.BFMatcher().knnMatch(des, ref.des, k=2)
-    # 1番目に似た点が2番目よりはっきり似ているものだけ残す（あいまいな対応を捨てる）
-    good = [a for a, b in (p for p in m if len(p) == 2) if a.distance < ratio * b.distance]
-    if len(good) < 12:
-        return None, len(good)
-    src = np.float32([kp[g.queryIdx].pt for g in good])
-    dst = np.float32([ref.kp[g.trainIdx].pt for g in good])
-    cv2.setRNGSeed(0)                                       # 毎回同じ結果になるように
-    method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
-    H, inl = cv2.findHomography(src, dst, method, 4.0, maxIters=10000, confidence=0.999)
-    return H, int(inl.sum()) if inl is not None else 0
-
-
-def refine_ecc(gray, ref_gray, H, mask, iters=80):
-    """変換 H を ECC で微調整する（mask の範囲の明るさが一致するように）。"""
-    h, w = ref_gray.shape
-    warped = cv2.warpPerspective(gray, H, (w, h))
-    a = cv2.GaussianBlur(_prep(ref_gray), (0, 0), 2).astype(np.float32)
-    b = cv2.GaussianBlur(_prep(warped), (0, 0), 2).astype(np.float32)
-    W = np.eye(3, dtype=np.float32)
-    try:
-        cc, W = cv2.findTransformECC(a, b, W, cv2.MOTION_HOMOGRAPHY,
-                                     (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iters, 1e-5),
-                                     mask.astype(np.uint8), 5)
-    except cv2.error:
-        return H, 0.0
-    return np.linalg.inv(W).astype(np.float64) @ H, float(cc)
 '''
 FILES['crack_v14/screen_crop.py'] = r'''"""（テスト用）モニターをスマホで撮った写真から、画面の部分だけを切り出して 960x660 にする。本番では使わない。"""
 import cv2, numpy as np
@@ -1151,7 +1160,7 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 
 ## 処理の流れ（inspect_v14.py）
 1. **位置合わせ**: `template_table1.png`（右側のネジ2つと留め具）を `cv2.matchTemplate` で探し、X・Y のずれを補正して 960x660 に縮小（align.py）
-2. **種類の判定**: type1・type2 の基準画像と輪郭を比べ、よく合う方にする（明るさは使わない）
+2. **種類の判定**: 種類ごとの基準画像と輪郭を比べ、よく合う方にする（明るさは使わない）
 3. **背面光の判定**: U字の開口部が明るいか
 4. **割れらしさ**: 画素ごとに割れっぽさを 0〜1 で数値化（features.py）
    - D: 周りより暗く、細長い所
@@ -1175,17 +1184,19 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 ```
 pip install -r requirements.txt
 
-# 1. 基準を作る（最初の1回）。OK画像のフォルダは種類が混ざっていてよい
-#    仮の基準画像 data/refs/ref_type1.png, ref_type2.png が必要
+# 1. 基準画像を作る（最初の1回）。OK画像のフォルダは製品の種類が混ざっていてよい（自動で振り分け）
 python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
-#    -> refs/check_type1.jpg, check_type2.jpg で線を確認
-#       緑 = U字内縁の縁取りのすぐ外側、赤 = 縦リブと下端、青 = 樹脂の部分 になっていれば OK
-#       ずれていたら --move-geom DX DY（右・下に何px）、--scale-geom（何倍）を付けて作り直す
 
-# 2. 検査
+# 2. 検査範囲の線を引く（種類ごとに1回）。基準画像が表示されるのでクリックする
+python -m crack_v14.draw_geom --ref-dir refs
+#    手順: (1) U字の縁取りの外側を左の脚の上→底→右の脚の上 (2) 左の縦リブ 上下2点 (3) 右の縦リブ 上下2点
+#          (4) ゲートの切り欠きを囲む四角 2点（無ければEnter） (5) 検査を始める高さ 1点
+#    左クリック=点、右クリック=戻す、Enter=次へ。終わると refs/check_<種類>.jpg が出るので確認する
+
+# 3. 検査
 python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
 
-# 3. 正解CSVとの比較
+# 4. 正解CSVとの比較
 python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out --role VALIDATION
 ```
 
@@ -1199,8 +1210,8 @@ python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out -
 | crossing.py | 内縁 -> 外縁の経路探索、縁取りの途切れ |
 | geodesic.py | 最短経路探索（ダイクストラ法） |
 | geometry.py | 検査範囲の座標とマスク |
-| make_ref.py | OK画像から基準を作る（最初の1回） |
-| register.py | 特徴点照合（make_ref だけで使用） |
+| make_ref.py | OK画像から基準画像を作る（最初の1回） |
+| draw_geom.py | 基準画像の上でクリックして検査範囲の線を引く（種類ごとに1回） |
 | evaluate.py | 正解CSVとの比較 |
 | screen_crop.py | （テスト用）画面撮影写真の切り出し |
 
@@ -1210,7 +1221,7 @@ python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out -
 - No.16 の中央の細い線は検出できていない（同じ位置に成形線があり、OK画像との比較が必要）
 '''
 FILES['requirements.txt'] = r'''# 動作確認済み: Python 3.12 / opencv 4.9.0 / numpy 1.26.4 / numba 0.60.0
-opencv-python>=4.4      # SIFT が本体に入ったのは 4.4 から（headless 版でも可）
+opencv-python>=4.4      # draw_geom の画面表示に必要（headless 版は不可）
 numpy>=1.24
 numba>=0.57             # 無くても動く（最短経路が純Pythonになり遅くなる）
 '''

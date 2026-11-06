@@ -10,7 +10,7 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 
 ## 処理の流れ（inspect_v14.py）
 1. **位置合わせ**: `template_table1.png`（右側のネジ2つと留め具）を `cv2.matchTemplate` で探し、X・Y のずれを補正して 960x660 に縮小（align.py）
-2. **種類の判定**: type1・type2 の基準画像と輪郭を比べ、よく合う方にする（明るさは使わない）
+2. **種類の判定**: 種類ごとの基準画像と輪郭を比べ、よく合う方にする（明るさは使わない）
 3. **背面光の判定**: U字の開口部が明るいか
 4. **割れらしさ**: 画素ごとに割れっぽさを 0〜1 で数値化（features.py）
    - D: 周りより暗く、細長い所
@@ -34,17 +34,19 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 ```
 pip install -r requirements.txt
 
-# 1. 基準を作る（最初の1回）。OK画像のフォルダは種類が混ざっていてよい
-#    仮の基準画像 data/refs/ref_type1.png, ref_type2.png が必要
+# 1. 基準画像を作る（最初の1回）。OK画像のフォルダは製品の種類が混ざっていてよい（自動で振り分け）
 python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
-#    -> refs/check_type1.jpg, check_type2.jpg で線を確認
-#       緑 = U字内縁の縁取りのすぐ外側、赤 = 縦リブと下端、青 = 樹脂の部分 になっていれば OK
-#       ずれていたら --move-geom DX DY（右・下に何px）、--scale-geom（何倍）を付けて作り直す
 
-# 2. 検査
+# 2. 検査範囲の線を引く（種類ごとに1回）。基準画像が表示されるのでクリックする
+python -m crack_v14.draw_geom --ref-dir refs
+#    手順: (1) U字の縁取りの外側を左の脚の上→底→右の脚の上 (2) 左の縦リブ 上下2点 (3) 右の縦リブ 上下2点
+#          (4) ゲートの切り欠きを囲む四角 2点（無ければEnter） (5) 検査を始める高さ 1点
+#    左クリック=点、右クリック=戻す、Enter=次へ。終わると refs/check_<種類>.jpg が出るので確認する
+
+# 3. 検査
 python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
 
-# 3. 正解CSVとの比較
+# 4. 正解CSVとの比較
 python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out --role VALIDATION
 ```
 
@@ -58,8 +60,8 @@ python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out -
 | crossing.py | 内縁 -> 外縁の経路探索、縁取りの途切れ |
 | geodesic.py | 最短経路探索（ダイクストラ法） |
 | geometry.py | 検査範囲の座標とマスク |
-| make_ref.py | OK画像から基準を作る（最初の1回） |
-| register.py | 特徴点照合（make_ref だけで使用） |
+| make_ref.py | OK画像から基準画像を作る（最初の1回） |
+| draw_geom.py | 基準画像の上でクリックして検査範囲の線を引く（種類ごとに1回） |
 | evaluate.py | 正解CSVとの比較 |
 | screen_crop.py | （テスト用）画面撮影写真の切り出し |
 

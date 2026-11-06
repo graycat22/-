@@ -8,11 +8,12 @@
   5. 経路探索     : 内縁から外縁まで、割れっぽい所だけを通って抜けられるか（crossing.py）
   6. 判定         : 割れの定義「U字の内側から外縁まで、端から端まで割れている」を満たせば NG
 
-基準フォルダ（refs/）の中身（make_ref.py が作る）:
-  ref_<種類>.png      基準画像（OK画像の中央値、基準座標 960x660）
-  geom_<種類>.json    検査範囲の座標
-  info_<種類>.json    基準画像を作ったときのテンプレート位置と画像サイズ
+基準フォルダ（refs/）の中身:
+  ref_<種類>.png      基準画像（OK画像の中央値、基準座標 960x660）     make_ref.py が作る
+  info_<種類>.json    基準画像を作ったときのテンプレート位置と画像サイズ   make_ref.py が作る
+  geom_<種類>.json    検査範囲の座標                                       draw_geom.py で線を引いて作る
 """
+import glob
 import json
 import os
 
@@ -22,7 +23,7 @@ import numpy as np
 from .align import TemplateAligner, frame_matrix, to_frame
 from .crossing import Crossing
 from .features import bright_gap_map, dark_line_map, to_prob
-from .geometry import KINDS, SIZE, load_geom
+from .geometry import SIZE, load_geom
 
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
@@ -76,16 +77,19 @@ class Kind:
 
 
 def load_kinds(ref_dir):
-    """refs/ から使える種類を全部読み込む。"""
+    """refs/ から、基準画像・info・検査範囲の3つが揃っている種類を全部読み込む。"""
     kinds = {}
-    for k in KINDS:
-        rp = os.path.join(ref_dir, f"ref_{k}.png")
+    for rp in sorted(glob.glob(os.path.join(ref_dir, "ref_*.png"))):
+        k = os.path.basename(rp)[4:-4]
         ip = os.path.join(ref_dir, f"info_{k}.json")
-        if not (os.path.exists(rp) and os.path.exists(ip)):
-            continue
+        g = load_geom(ref_dir, k)
+        if not os.path.exists(ip):
+            print(f"注意: {ip} が無いので {k} は検査しません（make_ref で作り直してください）"); continue
+        if g is None:
+            print(f"注意: {k} の検査範囲が無いので {k} は検査しません（draw_geom で線を引いてください）"); continue
         with open(ip, encoding="utf-8") as f:
             info = json.load(f)
-        kinds[k] = Kind(k, cv2.imread(rp, 0), load_geom(ref_dir, k), info["tpl_xy"], info["src_size"])
+        kinds[k] = Kind(k, cv2.imread(rp, 0), g, info["tpl_xy"], info["src_size"])
     return kinds
 
 
@@ -93,8 +97,7 @@ class Inspector:
     def __init__(self, ref_dir, template_gray, params=None):
         self.kinds = load_kinds(ref_dir)
         if not self.kinds:
-            raise SystemExit(f"基準がありません: {ref_dir} に ref_<種類>.png と info_<種類>.json が必要です"
-                             f"（make_ref で作ってください）")
+            raise SystemExit(f"使える基準がありません: {ref_dir}（make_ref と draw_geom を先に実行してください）")
         self.aligner = TemplateAligner(template_gray)
         self.p = dict(PARAMS, **(params or {}))
 
