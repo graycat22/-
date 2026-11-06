@@ -91,23 +91,30 @@ def main():
         lw = max(2, round(vis.shape[1] / 320))           # 画像の大きさに合わせた線の太さ
         # 見つけた U字と縦リブ（細い線、確認用）
         cv2.polylines(vis, [r["u_img"]["rim"].astype(np.int32)], False, (0, 200, 0), max(1, lw // 2))
+        if "frame" in r["u_img"]:
+            cv2.polylines(vis, [r["u_img"]["frame"].astype(np.int32)], False, (0, 0, 200), max(1, lw // 2))
         for line in r["u_img"]["ribs"]:
             cv2.polylines(vis, [line.astype(np.int32)], False, (0, 220, 255), max(1, lw // 2))
         for t in ("D", "B"):
             for i, q in enumerate(r["res"].get(t, [])):
                 if q["ng"]:
-                    cv2.polylines(vis, [q["path_img"].astype(np.int32)], False, COLORS[t], lw)
+                    if "region" in q:                     # 割れの領域を幅のまま半透明で塗る
+                        reg = cv2.resize(q["region"].astype(np.uint8), (vis.shape[1], vis.shape[0]),
+                                         interpolation=cv2.INTER_NEAREST).astype(bool)
+                        vis[reg] = (0.4 * vis[reg] + 0.6 * np.array(COLORS[t])).astype(np.uint8)
+                    cv2.polylines(vis, [q["path_img"].astype(np.int32)], False, COLORS[t], max(1, lw // 2))
                 rb, rc = q.get("rim_break"), q.get("reach")
                 msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
                         f" in={q['inner_gap']:.0f} out={q['outer_gap']:.0f}"
                         + (f" rim={rb:.2f}" if rb is not None else "")
                         + (f" reach={rc:.2f}" if rc is not None else "")
+                        + (f" 幅={q['width_px']:.1f}px(最大{q['width_max_px']:.1f})" if "width_px" in q else "")
                         + (" NG" if q["ng"] else ""))
                 (x1, y1), (x2, y2) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
                 rows.append([name, t, i, round(q["ratio"], 3), round(q["max_gap"], 1),
                              round(q["inner_gap"], 1), round(q["outer_gap"], 1),
                              "" if rb is None else round(rb, 3), "" if rc is None else round(rc, 3),
-                             q["ng"], x1, y1, x2, y2])
+                             q["ng"], round(q.get("width_px", 0), 1), round(q.get("width_max_px", 0), 1), x1, y1, x2, y2])
         print(msg)
         summary.append([name, r["judgment"], r["detail"], len(r["defects"])])
 
@@ -128,7 +135,7 @@ def main():
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["img", "type", "rank", "ratio", "max_gap", "inner_gap", "outer_gap",
-                    "rim_break", "reach", "ng", "x1", "y1", "x2", "y2"])
+                    "rim_break", "reach", "ng", "width_px", "width_max_px", "x1", "y1", "x2", "y2"])
         w.writerows(rows)
     n_ng = sum(1 for r in summary if r[1] == "NG")
     n_err = sum(1 for r in summary if r[1] == "ERROR")

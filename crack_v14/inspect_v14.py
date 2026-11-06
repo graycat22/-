@@ -20,7 +20,7 @@ from .u_detect import detect_geometry
 
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
-    ratio_th=0.35,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ）
+    ratio_th=0.30,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ。本物は最大 0.25、OK品の傷は 0.31〜）
     b_ratio_th=0.50,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
     end_gap_inner=15.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
@@ -116,16 +116,40 @@ class Inspector:
                     q["ng"] = q["ng"] and ends_ok and q["reach"] >= p["reach_th"]
                 else:
                     q["rim_break"], ri = cr.rim_break(frame, start)
-                    if cr.rim_ignored(ri):
+                    at_gate = cr.rim_ignored(ri)
+                    if at_gate:
                         q["rim_break"] = 0.0                            # ゲートの切り欠きは数えない
                     P = q["path"]
                     detour = q["length"] / max(float(to_outer[P[0, 0], P[0, 1]]), 1.0)
                     q["detour"] = detour
-                    solid = q["max_gap"] <= p["solid_gap_th"] and (
+                    # ゲートから真下の穴へは、OK品にも同じ位置に成形線が通っている。ゲートから始まる線は
+                    # 「きれいにつながっている」だけでは NG にしない（縁取りの途切れが必要）
+                    solid = (not at_gate) and q["max_gap"] <= p["solid_gap_th"] and (
                         q["ratio"] <= p["solid_ratio_th"]
                         or (q["ratio"] <= p["direct_ratio_th"] and detour <= p["direct_detour"]))
                     q["ng"] = q["ng"] and ends_ok and (q["rim_break"] >= p["rim_break_th"] or solid)
                 q.pop("prob", None)
+
+        # 割れの幅: 割れらしい画素の塊のうち、経路の近くにある部分を「割れの領域」として、
+        # 経路の各点での太さ（中心から縁までの距離 × 2）を測る
+        maps = {"D": pd}
+        if lit:
+            maps["B"] = pb
+        sx_in = gray.shape[1] / SIZE[0]                         # 検査の座標 1px = 入力画像の何px か
+        for t, cands in res.items():
+            crack = (maps[t] > 0.15).astype(np.uint8)
+            dt = cv2.distanceTransform(crack, cv2.DIST_L2, 3)
+            for q in cands:
+                if not q["ng"]:
+                    continue
+                P = q["path"]
+                near = np.zeros(crack.shape, np.uint8)
+                cv2.polylines(near, [P[:, ::-1].astype(np.int32)], False, 1, 15)
+                q["region"] = (crack & near).astype(bool)            # 割れの領域（幅のある形）
+                w = 2 * dt[P[:, 0], P[:, 1]]
+                w = w[w > 0]
+                q["width_px"] = float(np.median(w) * sx_in) if len(w) else 0.0      # 入力画像での幅 [px]
+                q["width_max_px"] = float(np.percentile(w, 95) * sx_in) if len(w) else 0.0
 
         # 見つけた経路・U字の線を入力画像の座標に戻す（結果の描画と CSV 用）
         Minv = np.linalg.inv(M)
@@ -142,5 +166,8 @@ class Inspector:
                     defects.append(dict(type=t, bbox=(int(x1), int(y1), int(x2), int(y2))))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
         u_img = dict(rim=back(geom["opening"][1:-1]), ribs=[back(line) for line in geom["outer"][:2]])
+        if "frame_box" in geom:                                  # カセットの外側の縁（確認用の赤い枠）
+            a_, b_ = geom["frame_box"]; yb_ = max(y for _, y in geom["plate"])
+            u_img["frame"] = back([(a_, 0), (b_, 0), (b_, yb_), (a_, yb_), (a_, 0)])
         return dict(kind="auto", backlit=lit, u_score=uscore, geom=geom, u_img=u_img, M=M, frame=frame,
                     res=res, judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))

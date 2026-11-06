@@ -68,7 +68,7 @@ def u_model(cx, w, cy, ry, sq, n_arc=120, leg_step=6.0):
     return np.vstack([left, arc, right])
 
 
-def find_opening(frame):
+def find_opening(frame, sigma=2.0, bottom_seed=0.97):
     """U字の開口部（縁取りの内側の穴）を、領域として切り出す（ウォーターシェッド法）。
 
     考え方:
@@ -80,12 +80,12 @@ def find_opening(frame):
     そのあと、明るい割れに沿って細く漏れた部分を、太い円で削って取り除く。
     """
     H, W = frame.shape
-    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), sigma)
     gm = cv2.magnitude(cv2.Sobel(f, cv2.CV_32F, 1, 0), cv2.Sobel(f, cv2.CV_32F, 0, 1))
     gm = np.clip(gm / (np.percentile(gm, 99) + 1e-6) * 255, 0, 255).astype(np.uint8)
     mk = np.zeros((H, W), np.int32)
     mk[int(0.12 * H):int(0.30 * H), int(0.49 * W):int(0.51 * W)] = 1          # 中の種
-    mk[int(0.97 * H):, :] = 2; mk[:, :int(0.03 * W)] = 2; mk[:, int(0.97 * W):] = 2   # 外の種
+    mk[int(bottom_seed * H):, :] = 2; mk[:, :int(0.03 * W)] = 2; mk[:, int(0.97 * W):] = 2   # 外の種
     ws = cv2.watershed(cv2.cvtColor(gm, cv2.COLOR_GRAY2BGR), mk)
     op = (ws == 1).astype(np.uint8)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
@@ -240,8 +240,37 @@ def find_plate_bottom(frame, lx, rx, y_start):
 def detect_geometry(frame, edge_margin=3, min_thick=40):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
-    op = find_opening(frame)                                    # U字の開口部を領域として切り出す
-    up, fit_err = fit_u_to_mask(op)                             # その輪郭に綺麗なU字を当てはめる
+    # ウォーターシェッドは画像のわずかな違いで結果が変わることがあるので、ぼかし具合と「外」の種を
+    # 変えて何通りか作り、「線の内側が明るく、外側（樹脂）が暗い」がいちばんはっきりした U字を選ぶ
+    img_s = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 1.5)
+    best, primary = None, None
+    for sigma in (1.5, 2.0, 3.0):
+        for bseed in (0.97, 0.80):
+            op_ = find_opening(frame, sigma, bseed)
+            if op_.sum() < 0.02 * op_.size:
+                continue
+            up_, err_ = fit_u_to_mask(op_)
+            c = u_model(*up_, n_arc=80, leg_step=8.0)
+            c = c[c[:, 1] > 0.1 * H]
+            t = np.gradient(c, axis=0); t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+            nrm = np.stack([t[:, 1], -t[:, 0]], 1)               # 内側向き
+            def val(q):
+                x = np.clip(q[:, 0], 0, W - 1).astype(np.float32).reshape(1, -1)
+                y = np.clip(q[:, 1], 0, H - 1).astype(np.float32).reshape(1, -1)
+                return cv2.remap(img_s, x, y, cv2.INTER_LINEAR).ravel()
+            pol = np.mean([val(c + d * nrm) - val(c - d * nrm) for d in (4, 8, 12)], axis=0)
+            score = float(np.clip(pol, -40, 40).mean()) - 0.5 * err_
+            if sigma == 2.0 and bseed == 0.97:
+                primary = (score, op_, up_, err_)
+            if best is None or score > best[0]:
+                best = (score, op_, up_, err_)
+    # 基本は標準の設定（ぼかし2・下端の種）の結果を使う。開口部がプレートまで漏れて
+    # U字の底が画像の下の方まで来てしまった（明らかに失敗した）ときだけ、別の結果に替える
+    if primary is not None:
+        p_bottom = primary[2][2] + primary[2][3]
+        if p_bottom < 0.72 * H or best[0] < primary[0] + 8:
+            best = primary
+    _, op, up, fit_err = best
     cx, cy = up[0], up[2]
     total = 60.0 - fit_err                                      # はっきり度: 当てはまりが良いほど大きい
     rim = u_model(*up)

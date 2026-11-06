@@ -102,23 +102,30 @@ def main():
         lw = max(2, round(vis.shape[1] / 320))           # 画像の大きさに合わせた線の太さ
         # 見つけた U字と縦リブ（細い線、確認用）
         cv2.polylines(vis, [r["u_img"]["rim"].astype(np.int32)], False, (0, 200, 0), max(1, lw // 2))
+        if "frame" in r["u_img"]:
+            cv2.polylines(vis, [r["u_img"]["frame"].astype(np.int32)], False, (0, 0, 200), max(1, lw // 2))
         for line in r["u_img"]["ribs"]:
             cv2.polylines(vis, [line.astype(np.int32)], False, (0, 220, 255), max(1, lw // 2))
         for t in ("D", "B"):
             for i, q in enumerate(r["res"].get(t, [])):
                 if q["ng"]:
-                    cv2.polylines(vis, [q["path_img"].astype(np.int32)], False, COLORS[t], lw)
+                    if "region" in q:                     # 割れの領域を幅のまま半透明で塗る
+                        reg = cv2.resize(q["region"].astype(np.uint8), (vis.shape[1], vis.shape[0]),
+                                         interpolation=cv2.INTER_NEAREST).astype(bool)
+                        vis[reg] = (0.4 * vis[reg] + 0.6 * np.array(COLORS[t])).astype(np.uint8)
+                    cv2.polylines(vis, [q["path_img"].astype(np.int32)], False, COLORS[t], max(1, lw // 2))
                 rb, rc = q.get("rim_break"), q.get("reach")
                 msg += (f" | {t}{i} r={q['ratio']:.2f} gap={q['max_gap']:.0f}"
                         f" in={q['inner_gap']:.0f} out={q['outer_gap']:.0f}"
                         + (f" rim={rb:.2f}" if rb is not None else "")
                         + (f" reach={rc:.2f}" if rc is not None else "")
+                        + (f" 幅={q['width_px']:.1f}px(最大{q['width_max_px']:.1f})" if "width_px" in q else "")
                         + (" NG" if q["ng"] else ""))
                 (x1, y1), (x2, y2) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
                 rows.append([name, t, i, round(q["ratio"], 3), round(q["max_gap"], 1),
                              round(q["inner_gap"], 1), round(q["outer_gap"], 1),
                              "" if rb is None else round(rb, 3), "" if rc is None else round(rc, 3),
-                             q["ng"], x1, y1, x2, y2])
+                             q["ng"], round(q.get("width_px", 0), 1), round(q.get("width_max_px", 0), 1), x1, y1, x2, y2])
         print(msg)
         summary.append([name, r["judgment"], r["detail"], len(r["defects"])])
 
@@ -139,7 +146,7 @@ def main():
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["img", "type", "rank", "ratio", "max_gap", "inner_gap", "outer_gap",
-                    "rim_break", "reach", "ng", "x1", "y1", "x2", "y2"])
+                    "rim_break", "reach", "ng", "width_px", "width_max_px", "x1", "y1", "x2", "y2"])
         w.writerows(rows)
     n_ng = sum(1 for r in summary if r[1] == "NG")
     n_err = sum(1 for r in summary if r[1] == "ERROR")
@@ -733,7 +740,7 @@ from .u_detect import detect_geometry
 
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
-    ratio_th=0.35,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ）
+    ratio_th=0.30,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ。本物は最大 0.25、OK品の傷は 0.31〜）
     b_ratio_th=0.50,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
     end_gap_inner=15.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
@@ -829,16 +836,40 @@ class Inspector:
                     q["ng"] = q["ng"] and ends_ok and q["reach"] >= p["reach_th"]
                 else:
                     q["rim_break"], ri = cr.rim_break(frame, start)
-                    if cr.rim_ignored(ri):
+                    at_gate = cr.rim_ignored(ri)
+                    if at_gate:
                         q["rim_break"] = 0.0                            # ゲートの切り欠きは数えない
                     P = q["path"]
                     detour = q["length"] / max(float(to_outer[P[0, 0], P[0, 1]]), 1.0)
                     q["detour"] = detour
-                    solid = q["max_gap"] <= p["solid_gap_th"] and (
+                    # ゲートから真下の穴へは、OK品にも同じ位置に成形線が通っている。ゲートから始まる線は
+                    # 「きれいにつながっている」だけでは NG にしない（縁取りの途切れが必要）
+                    solid = (not at_gate) and q["max_gap"] <= p["solid_gap_th"] and (
                         q["ratio"] <= p["solid_ratio_th"]
                         or (q["ratio"] <= p["direct_ratio_th"] and detour <= p["direct_detour"]))
                     q["ng"] = q["ng"] and ends_ok and (q["rim_break"] >= p["rim_break_th"] or solid)
                 q.pop("prob", None)
+
+        # 割れの幅: 割れらしい画素の塊のうち、経路の近くにある部分を「割れの領域」として、
+        # 経路の各点での太さ（中心から縁までの距離 × 2）を測る
+        maps = {"D": pd}
+        if lit:
+            maps["B"] = pb
+        sx_in = gray.shape[1] / SIZE[0]                         # 検査の座標 1px = 入力画像の何px か
+        for t, cands in res.items():
+            crack = (maps[t] > 0.15).astype(np.uint8)
+            dt = cv2.distanceTransform(crack, cv2.DIST_L2, 3)
+            for q in cands:
+                if not q["ng"]:
+                    continue
+                P = q["path"]
+                near = np.zeros(crack.shape, np.uint8)
+                cv2.polylines(near, [P[:, ::-1].astype(np.int32)], False, 1, 15)
+                q["region"] = (crack & near).astype(bool)            # 割れの領域（幅のある形）
+                w = 2 * dt[P[:, 0], P[:, 1]]
+                w = w[w > 0]
+                q["width_px"] = float(np.median(w) * sx_in) if len(w) else 0.0      # 入力画像での幅 [px]
+                q["width_max_px"] = float(np.percentile(w, 95) * sx_in) if len(w) else 0.0
 
         # 見つけた経路・U字の線を入力画像の座標に戻す（結果の描画と CSV 用）
         Minv = np.linalg.inv(M)
@@ -855,6 +886,9 @@ class Inspector:
                     defects.append(dict(type=t, bbox=(int(x1), int(y1), int(x2), int(y2))))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
         u_img = dict(rim=back(geom["opening"][1:-1]), ribs=[back(line) for line in geom["outer"][:2]])
+        if "frame_box" in geom:                                  # カセットの外側の縁（確認用の赤い枠）
+            a_, b_ = geom["frame_box"]; yb_ = max(y for _, y in geom["plate"])
+            u_img["frame"] = back([(a_, 0), (b_, 0), (b_, yb_), (a_, yb_), (a_, 0)])
         return dict(kind="auto", backlit=lit, u_score=uscore, geom=geom, u_img=u_img, M=M, frame=frame,
                     res=res, judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))
 '''
@@ -1108,7 +1142,7 @@ def u_model(cx, w, cy, ry, sq, n_arc=120, leg_step=6.0):
     return np.vstack([left, arc, right])
 
 
-def find_opening(frame):
+def find_opening(frame, sigma=2.0, bottom_seed=0.97):
     """U字の開口部（縁取りの内側の穴）を、領域として切り出す（ウォーターシェッド法）。
 
     考え方:
@@ -1120,12 +1154,12 @@ def find_opening(frame):
     そのあと、明るい割れに沿って細く漏れた部分を、太い円で削って取り除く。
     """
     H, W = frame.shape
-    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), sigma)
     gm = cv2.magnitude(cv2.Sobel(f, cv2.CV_32F, 1, 0), cv2.Sobel(f, cv2.CV_32F, 0, 1))
     gm = np.clip(gm / (np.percentile(gm, 99) + 1e-6) * 255, 0, 255).astype(np.uint8)
     mk = np.zeros((H, W), np.int32)
     mk[int(0.12 * H):int(0.30 * H), int(0.49 * W):int(0.51 * W)] = 1          # 中の種
-    mk[int(0.97 * H):, :] = 2; mk[:, :int(0.03 * W)] = 2; mk[:, int(0.97 * W):] = 2   # 外の種
+    mk[int(bottom_seed * H):, :] = 2; mk[:, :int(0.03 * W)] = 2; mk[:, int(0.97 * W):] = 2   # 外の種
     ws = cv2.watershed(cv2.cvtColor(gm, cv2.COLOR_GRAY2BGR), mk)
     op = (ws == 1).astype(np.uint8)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41))
@@ -1280,8 +1314,37 @@ def find_plate_bottom(frame, lx, rx, y_start):
 def detect_geometry(frame, edge_margin=3, min_thick=40):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
-    op = find_opening(frame)                                    # U字の開口部を領域として切り出す
-    up, fit_err = fit_u_to_mask(op)                             # その輪郭に綺麗なU字を当てはめる
+    # ウォーターシェッドは画像のわずかな違いで結果が変わることがあるので、ぼかし具合と「外」の種を
+    # 変えて何通りか作り、「線の内側が明るく、外側（樹脂）が暗い」がいちばんはっきりした U字を選ぶ
+    img_s = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 1.5)
+    best, primary = None, None
+    for sigma in (1.5, 2.0, 3.0):
+        for bseed in (0.97, 0.80):
+            op_ = find_opening(frame, sigma, bseed)
+            if op_.sum() < 0.02 * op_.size:
+                continue
+            up_, err_ = fit_u_to_mask(op_)
+            c = u_model(*up_, n_arc=80, leg_step=8.0)
+            c = c[c[:, 1] > 0.1 * H]
+            t = np.gradient(c, axis=0); t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+            nrm = np.stack([t[:, 1], -t[:, 0]], 1)               # 内側向き
+            def val(q):
+                x = np.clip(q[:, 0], 0, W - 1).astype(np.float32).reshape(1, -1)
+                y = np.clip(q[:, 1], 0, H - 1).astype(np.float32).reshape(1, -1)
+                return cv2.remap(img_s, x, y, cv2.INTER_LINEAR).ravel()
+            pol = np.mean([val(c + d * nrm) - val(c - d * nrm) for d in (4, 8, 12)], axis=0)
+            score = float(np.clip(pol, -40, 40).mean()) - 0.5 * err_
+            if sigma == 2.0 and bseed == 0.97:
+                primary = (score, op_, up_, err_)
+            if best is None or score > best[0]:
+                best = (score, op_, up_, err_)
+    # 基本は標準の設定（ぼかし2・下端の種）の結果を使う。開口部がプレートまで漏れて
+    # U字の底が画像の下の方まで来てしまった（明らかに失敗した）ときだけ、別の結果に替える
+    if primary is not None:
+        p_bottom = primary[2][2] + primary[2][3]
+        if p_bottom < 0.72 * H or best[0] < primary[0] + 8:
+            best = primary
+    _, op, up, fit_err = best
     cx, cy = up[0], up[2]
     total = 60.0 - fit_err                                      # はっきり度: 当てはまりが良いほど大きい
     rim = u_model(*up)
