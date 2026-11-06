@@ -201,7 +201,9 @@ class Crossing:
         cum0, _ = MCP(np.where(walk, 1.0, np.inf)).find_costs(self.starts)
         ends = np.argwhere(self.m["outer"])
         th = cum0[ends[:, 0], ends[:, 1]]
-        keep = (ends[:, 0] >= y0) & np.isfinite(th) & (th >= geom.get("min_thick", 60))
+        # 起点を縁取りの内側に置いたときは、縁取りの太さぶん厚く測れるので、その分を足して比べる
+        extra = (geom.get("rim_width") or 0) + 6 if self.m["rim"].any() else 0
+        keep = (ends[:, 0] >= y0) & np.isfinite(th) & (th >= geom.get("min_thick", 60) + extra)
         self.ends, self.thick = ends[keep], th[keep]
 
         # プレートの端（縦リブの縁）は黒い線が必ずあるので、割れの証拠として数えない帯にする
@@ -783,9 +785,16 @@ class Inspector:
             P = q["path"]
             return float(max((dist[P[:, 0], P[:, 1]] < hug_d).mean(), (dist_rib[P[:, 0], P[:, 1]] < 25).mean()))
 
+        rim_mask = cr.m["rim"]
+
         def reject(q):
-            """割れではない道: 大部分が縁・縦リブに沿っている、または終点が起点よりかなり上（脚の溝を上へ這う）"""
-            return hug(q) > p["hug_max"] or q["path"][0, 0] - q["path"][-1, 0] > p["up_max"]
+            """割れではない道:
+              大部分が縁・縦リブに沿っている / 終点が起点よりかなり上（脚の溝を上へ這う）/
+              縁取りの中を縁に沿って長く進んでいる（割れは縁取りをまっすぐ横切る）"""
+            P = q["path"]
+            in_rim = rim_mask[P[:, 0], P[:, 1]].sum() * 1.0
+            along = in_rim > 2.5 * (geom.get("rim_width") or 16) + 12
+            return hug(q) > p["hug_max"] or P[0, 0] - P[-1, 0] > p["up_max"] or along
 
         # 3-5. 背面光 -> 割れらしさ -> 経路探索
         lit = is_backlit(frame, cr.m["opening"])
