@@ -36,7 +36,7 @@ class Crossing:
         self.starts = np.argwhere(inner)
 
         # 歩ける範囲: 樹脂部分＋起点＋終点
-        walk = self.m["band"] | self.m["inner"] | self.m["outer"]
+        walk = self.m["band"] | self.m["inner"] | self.m["outer"] | self.m["rim"]
         walk[: max(0, y0 - 80)] = False
         self.walk = walk
 

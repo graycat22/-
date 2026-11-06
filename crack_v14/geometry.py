@@ -36,7 +36,8 @@ def build_masks(g, rim_band=10):
       opening : U字の開口部
       plate   : プレート全体
       band    : 割れが横切る樹脂部分（plate から opening を除いた所）
-      inner   : 割れの起点を探す帯（開口部の縁のすぐ外側、幅 rim_band）
+      inner   : 割れの起点を探す帯（縁取りの内側の端。rim_width が無いときは開口部の縁のすぐ外側）
+      rim     : 縁取りそのもの（経路が横切る所）
       outer   : 割れの終点（縦リブと下端の線）
     """
     shape = (SIZE[1], SIZE[0])
@@ -46,8 +47,18 @@ def build_masks(g, rim_band=10):
     open_dil = cv2.dilate(opening.astype(np.uint8), k).astype(bool)   # 開口部を rim_band だけ太らせる
     inner = open_dil & ~opening & plate
     band = plate & ~opening
+    rim = np.zeros(shape, bool)
+    rw = g.get("rim_width")
+    if g.get("start_inside", True) and rw:
+        # 割れの起点を「縁取りの内側の端」に置く。経路は縁取りそのものを横切らないと外へ出られないので、
+        # U字の内側（開口部）まで割れている割れだけが抜けられる（傷や影は明るい縁取りで止まる）
+        d = int(round(rw))
+        e1 = cv2.erode(opening.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1,) * 2))
+        e2 = cv2.erode(opening.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 13,) * 2))
+        rim = opening & ~e2.astype(bool) & plate            # 縁取り（緑の線から内側へ 太さ + 6px）
+        inner = e1.astype(bool) & ~e2.astype(bool) & plate  # 起点: 縁取りの内側の端の帯（幅 6px）
     outer = np.zeros(shape, bool)
     for line in g["outer"]:
         outer |= _poly(line, shape, closed=False, thick=5)
     outer &= band & ~open_dil
-    return dict(opening=opening, plate=plate, band=band, inner=inner, outer=outer)
+    return dict(opening=opening, plate=plate, band=band, inner=inner, outer=outer, rim=rim)

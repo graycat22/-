@@ -193,7 +193,7 @@ class Crossing:
         self.starts = np.argwhere(inner)
 
         # 歩ける範囲: 樹脂部分＋起点＋終点
-        walk = self.m["band"] | self.m["inner"] | self.m["outer"]
+        walk = self.m["band"] | self.m["inner"] | self.m["outer"] | self.m["rim"]
         walk[: max(0, y0 - 80)] = False
         self.walk = walk
 
@@ -681,7 +681,8 @@ def build_masks(g, rim_band=10):
       opening : U字の開口部
       plate   : プレート全体
       band    : 割れが横切る樹脂部分（plate から opening を除いた所）
-      inner   : 割れの起点を探す帯（開口部の縁のすぐ外側、幅 rim_band）
+      inner   : 割れの起点を探す帯（縁取りの内側の端。rim_width が無いときは開口部の縁のすぐ外側）
+      rim     : 縁取りそのもの（経路が横切る所）
       outer   : 割れの終点（縦リブと下端の線）
     """
     shape = (SIZE[1], SIZE[0])
@@ -691,11 +692,21 @@ def build_masks(g, rim_band=10):
     open_dil = cv2.dilate(opening.astype(np.uint8), k).astype(bool)   # 開口部を rim_band だけ太らせる
     inner = open_dil & ~opening & plate
     band = plate & ~opening
+    rim = np.zeros(shape, bool)
+    rw = g.get("rim_width")
+    if g.get("start_inside", True) and rw:
+        # 割れの起点を「縁取りの内側の端」に置く。経路は縁取りそのものを横切らないと外へ出られないので、
+        # U字の内側（開口部）まで割れている割れだけが抜けられる（傷や影は明るい縁取りで止まる）
+        d = int(round(rw))
+        e1 = cv2.erode(opening.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 1,) * 2))
+        e2 = cv2.erode(opening.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * d + 13,) * 2))
+        rim = opening & ~e2.astype(bool) & plate            # 縁取り（緑の線から内側へ 太さ + 6px）
+        inner = e1.astype(bool) & ~e2.astype(bool) & plate  # 起点: 縁取りの内側の端の帯（幅 6px）
     outer = np.zeros(shape, bool)
     for line in g["outer"]:
         outer |= _poly(line, shape, closed=False, thick=5)
     outer &= band & ~open_dil
-    return dict(opening=opening, plate=plate, band=band, inner=inner, outer=outer)
+    return dict(opening=opening, plate=plate, band=band, inner=inner, outer=outer, rim=rim)
 '''
 FILES['crack_v14/inspect_v14.py'] = r'''"""カセットワレ検査 V14 の本体。1枚の画像を受け取って OK / NG を返す。
 
@@ -725,8 +736,8 @@ PARAMS = dict(
     end_gap_inner=10.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     rim_break_th=0.30,    # D: 起点で縁取りがこれ以上切れていること（上げると過検出が減り、見逃しが増える）
-    solid_ratio_th=0.08,  # D: 縁取りの途切れが弱くても、ここまできれいに端から端までつながった割れ線なら NG
-    solid_gap_th=10.0,    #    （本物の割れ 0.05〜0.06 / 5px、OK品の傷・溝は 0.14 以上 / 20px 以上）
+    solid_ratio_th=0.12,  # D: 縁取りの途切れが弱くても、ここまできれいに端から端までつながった割れ線なら NG
+    solid_gap_th=10.0,    #    （本物の割れ 0.05〜0.09 / 5px、OK品の傷・溝は 0.17 以上 / 29px 以上）
     reach_th=0.90,        # B: 漏れた光が開口部までつながっている割合
     d_lo=0.10, d_hi=0.30, # D: 相対的な暗さ（×細長さ）がこの範囲で割れらしさ 0 -> 1
     b_lo=2.5, b_hi=6.0,   # B: 周りより明るい度合いがこの範囲で割れらしさ 0 -> 1
@@ -1156,7 +1167,9 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
    - 縦リブは脚のすぐ外側の一番はっきりした縦の線、ゲートの切り欠きは U字の一番下とする
 3. **背面光の判定**: U字の開口部の中が明るいか
 4. **割れらしさ**（features.py）: 画素ごとに割れっぽさを 0〜1 で数値化
-5. **経路探索**（crossing.py）: 内縁から外縁まで、割れっぽい所だけを通って抜けられる道を探す
+5. **経路探索**（crossing.py）: **縁取りの内側の端**から外縁まで、割れっぽい所だけを通って抜けられる道を探す。
+   起点を縁取りの内側に置くので、経路は縁取りそのものを横切らないと外へ出られない。
+   U字の内側まで割れている割れだけが抜けられ、傷や影は明るい縁取りで止まる
 6. **判定**: 下の条件を全部満たす道があれば NG
 
 ## 判定の条件と閾値（inspect_v14.py の PARAMS）
@@ -1168,7 +1181,7 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 | end_gap_outer | 25 px | 割れが外側の端から手前で止まってよい距離 | 半割れも NG になりやすい |
 | rim_break_th | 0.30 | D: 起点で U字の縁取りが切れている度合いの下限 | 過検出が減り、見逃しが増える |
 | b_ratio_th | 0.20 | B: ratio_th の明るい割れ用（リブの反射を除くため厳しく） | 見逃しが減り、過検出が増える |
-| solid_ratio_th / solid_gap_th | 0.08 / 10 px | D: 縁取りの途切れが弱くても、ここまでつながった割れ線なら NG | 見逃しが減り、過検出が増える |
+| solid_ratio_th / solid_gap_th | 0.12 / 10 px | D: 縁取りの途切れが弱くても、ここまでつながった割れ線なら NG | 見逃しが減り、過検出が増える |
 | reach_th | 0.90 | B: 漏れた光が開口部までつながっている割合の下限 | 過検出が減り、見逃しが増える |
 | hug_max | 0.6 | 経路が縁・縦リブにぴったり沿っている割合の上限（溝や影を除く） | 過検出が増える |
 | up_max | 40 px | 終点が起点よりこれ以上上なら割れとみなさない | 過検出が増える |
