@@ -62,25 +62,36 @@ def geom_from_clicks(rim, lrib, rrib, gate, top, edge_margin=10, min_thick=30):
     return g
 
 
-def snap_rim(ref, rim, search=18, step=4.0):
+def _smooth(a, k):
+    """点の並びを前後 k 点の平均でなめらかにする（両端はそのまま伸ばす）。"""
+    if k <= 1 or len(a) < k:
+        return a
+    pad = np.concatenate([np.repeat(a[:1], k // 2, 0), a, np.repeat(a[-1:], k // 2, 0)])
+    ker = np.ones(k) / k
+    return np.stack([np.convolve(pad[:, i], ker, mode="valid") for i in range(a.shape[1])], 1)
+
+
+def snap_rim(ref, rim, search=18, step=4.0, smooth_penalty=2.0):
     """クリックした縁取りの線を、近くの「本当の縁取りの外側の境目」に吸い付ける。
 
     線の各点で、線に垂直な方向に ±search px の範囲を調べ、
-    「外側（樹脂、暗い）から内側（縁取り、明るい）へ一番強く明るくなる所」に点を動かす。
-    大まかになぞっただけでも、縁取りの境目にぴったり合うようにするため。
+    「外側（樹脂、暗い）から内側（縁取り、明るい）へ明るくなる強さ」を測る。
+    ただし点ごとにバラバラに一番強い所へ動かすとガタガタになるので、
+    「隣の点とのずれは 1px まで、ずれるほど減点」という条件で、線全体として一番よく合う道を
+    動的計画法でまとめて選ぶ（なめらかな線になる）。
+
+    戻り値: (吸い付けた点の並び, 縁取りの太さ[px])
     """
     pts = np.array(rim, np.float64)
-    # 点を step px おきに並べ直す
     seg = [np.linspace(a, b, max(2, int(np.hypot(*(b - a)) / step)), endpoint=False) for a, b in zip(pts[:-1], pts[1:])]
-    c = np.vstack(seg + [pts[-1:]])
+    c = _smooth(np.vstack(seg + [pts[-1:]]), 9)          # クリックの角をならしてから法線を求める
     t = np.gradient(c, axis=0)
     t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
     n = np.stack([-t[:, 1], t[:, 0]], 1)
-    # 法線を開口部の内側に向ける（左の脚の上 -> 底 -> 右の脚の上 の順なら、内側は進行方向の左）
     poly = np.array([(c[0][0], 0)] + c.tolist() + [(c[-1][0], 0)], np.float32).reshape(-1, 1, 2)
     flip = np.array([cv2.pointPolygonTest(poly, (float(x + 6 * u), float(y + 6 * v)), False) < 0
                      for (x, y), (u, v) in zip(c, n)])
-    n[flip] *= -1
+    n[flip] *= -1                                         # 法線を開口部の内側へ向ける
     img = cv2.GaussianBlur(ref.astype(np.float32), (0, 0), 1.5)
 
     def val(q):
@@ -89,15 +100,36 @@ def snap_rim(ref, rim, search=18, step=4.0):
         return cv2.remap(img, x.reshape(1, -1), y.reshape(1, -1), cv2.INTER_LINEAR).ravel()
 
     ds = np.arange(-search, search + 1)
-    gain = np.stack([val(c + (d + 2) * n) - val(c + (d - 2) * n) for d in ds], 1)   # 内側へ向かう明るさの増え方
-    best = ds[np.argmax(gain, axis=1)].astype(np.float64)
-    best[gain.max(axis=1) < 8] = 0                      # はっきりした境目が無い所は動かさない
-    k = 11                                              # 飛び跳ねを抑える（前後11点の中央値）
-    pad = np.r_[[best[0]] * (k // 2), best, [best[-1]] * (k // 2)]
-    best = np.array([np.median(pad[i:i + k]) for i in range(len(best))])
-    out = c + best[:, None] * n
-    out[0], out[-1] = c[0], c[-1]                       # 両端（脚の上）はクリックした所のまま
-    return [(float(x), float(y)) for x, y in out]
+    gain = np.stack([val(c + (d + 2) * n) - val(c + (d - 2) * n) for d in ds], 1)   # 内側へ向かって明るくなる強さ
+    gain = np.clip(gain, -40, 80)
+
+    # ---- 動的計画法: 各点のずらし量 d を、隣とのずれ 1px 以内でなめらかに選ぶ
+    N, D = gain.shape
+    acc = gain[0].copy()
+    back = np.zeros((N, D), np.int64)
+    for i in range(1, N):
+        cand = np.full((3, D), -1e9)
+        for k, sh in enumerate((-1, 0, 1)):               # 前の点のずらし量が d-1, d, d+1 のどれか
+            prev = np.roll(acc, sh)
+            if sh == -1: prev[-1] = -1e9
+            if sh == 1: prev[0] = -1e9
+            cand[k] = prev - smooth_penalty * abs(sh)
+        arg = np.argmax(cand, 0)                          # 一番良かった前の点の選び方
+        # np.roll(acc, sh)[d] は acc[d - sh] なので、前の点のずらし量の番号は d - sh
+        back[i] = np.arange(D) - np.array((-1, 0, 1))[arg]
+        acc = cand[arg, np.arange(D)] + gain[i]
+    d_idx = np.zeros(N, np.int64)
+    d_idx[-1] = int(np.argmax(acc))
+    for i in range(N - 1, 0, -1):
+        d_idx[i - 1] = np.clip(back[i, d_idx[i]], 0, D - 1)
+    out = _smooth(c + ds[d_idx][:, None] * n, 5)
+
+    # ---- 縁取りの太さ: 外側の境目から内側へ進み、明るい縁取りが終わって暗くなる所までの距離
+    ws = np.arange(4, 46)
+    fall = np.stack([val(out + (w + 2) * n) - val(out + (w - 2) * n) for w in ws], 1)   # 内側へ向かって暗くなる所が負
+    strong = fall.min(1) < -15
+    width = float(np.median(ws[np.argmin(fall, 1)][strong])) if strong.any() else 16.0
+    return [(float(x), float(y)) for x, y in out], width
 
 
 def draw_check(ref, g):
@@ -179,10 +211,12 @@ def main():
             if ref is None or g is None:
                 print(f"[{kind}] 基準画像か線が無いので飛ばします"); continue
             rim = g["opening"][1:-1]                     # 上端で閉じるための点を除いた、クリックした縁取りの線
-            g["opening"] = [g["opening"][0]] + snap_rim(ref, rim) + [g["opening"][-1]]
+            new, width = snap_rim(ref, rim)
+            g["opening"] = [(new[0][0], 0.0)] + new + [(new[-1][0], 0.0)]
+            g["rim_width"] = width
             save_geom(a.ref_dir, kind, g)
             cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
-            print(f"[{kind}] 線を吸い付け直しました -> {a.ref_dir}/check_{kind}.jpg")
+            print(f"[{kind}] 線を吸い付け直しました（縁取りの太さ {width:.0f}px）-> {a.ref_dir}/check_{kind}.jpg")
         return
     kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[4:-4] for p in glob.glob(os.path.join(a.ref_dir, "ref_*.png")))
     if not kinds:
@@ -192,8 +226,9 @@ def main():
         pts = collect_clicks(ref, kind)
         if pts is None:
             print("中止しました"); return
-        rim = pts["rim"] if a.no_snap else snap_rim(ref, pts["rim"])
+        rim, width = (pts["rim"], 16.0) if a.no_snap else snap_rim(ref, pts["rim"])
         g = geom_from_clicks(rim, pts["lrib"], pts["rrib"], pts["gate"], pts["top"])
+        g["rim_width"] = width
         save_geom(a.ref_dir, kind, g)
         cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
         print(f"保存しました: {a.ref_dir}/geom_{kind}.json, check_{kind}.jpg")
