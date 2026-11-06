@@ -196,6 +196,9 @@ def detect_geometry(frame, edge_margin=10, min_thick=60):
     cx, cy = up[0], up[2]
     total = 60.0 - fit_err                                      # はっきり度: 当てはまりが良いほど大きい
     rim = u_model(*up)
+    # 開口部が実際に始まる高さ（カセットの上端が写っている型では、その上は背景なので検査しない）
+    rows = np.flatnonzero(op[:, int(up[0] - 0.5 * up[1]):int(up[0] + 0.5 * up[1])].any(1))
+    open_top = float(rows[0]) if len(rows) else 0.0
     _, width = snap_rim(frame, rim.tolist(), search=3, smooth_penalty=4.0)   # 縁取りの太さだけ測る
     rim = rim.tolist()
     rim = np.array(rim)
@@ -207,7 +210,7 @@ def detect_geometry(frame, edge_margin=10, min_thick=60):
     half = (rim[:, 0].max() - rim[:, 0].min()) / 2
     gw = max(18.0, 0.12 * half)                               # ゲートの切り欠きの範囲（U字の大きさに比例）
     g = dict(
-        y_eval=int(max(top_y + 10, cy - 0.15 * H)),       # 脚の一番上（ふちの近く）は検査しない
+        y_eval=int(open_top + 70),                         # 起点は y_eval-60 から = 開口部の一番上から 10px 下まで検査する
         edge_margin=edge_margin, min_thick=min_thick, rim_width=width,
         opening=[(float(rim[0][0]), 0.0)] + [tuple(map(float, p)) for p in rim] + [(float(rim[-1][0]), 0.0)],
         plate=[(lx, 0.0), (rx, 0.0), (rx, H - 1.0), (lx, H - 1.0)],
