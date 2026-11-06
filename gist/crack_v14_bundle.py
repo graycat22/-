@@ -725,6 +725,8 @@ PARAMS = dict(
     end_gap_inner=10.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     rim_break_th=0.30,    # D: 起点で縁取りがこれ以上切れていること（上げると過検出が減り、見逃しが増える）
+    solid_ratio_th=0.08,  # D: 縁取りの途切れが弱くても、ここまできれいに端から端までつながった割れ線なら NG
+    solid_gap_th=10.0,    #    （本物の割れ 0.05〜0.06 / 5px、OK品の傷・溝は 0.14 以上 / 20px 以上）
     reach_th=0.90,        # B: 漏れた光が開口部までつながっている割合
     d_lo=0.10, d_hi=0.30, # D: 相対的な暗さ（×細長さ）がこの範囲で割れらしさ 0 -> 1
     b_lo=2.5, b_hi=6.0,   # B: 周りより明るい度合いがこの範囲で割れらしさ 0 -> 1
@@ -800,7 +802,8 @@ class Inspector:
                     q["rim_break"], ri = cr.rim_break(frame, start)
                     if cr.rim_ignored(ri):
                         q["rim_break"] = 0.0                            # ゲートの切り欠きは数えない
-                    q["ng"] = q["ng"] and ends_ok and q["rim_break"] >= p["rim_break_th"]
+                    solid = q["ratio"] <= p["solid_ratio_th"] and q["max_gap"] <= p["solid_gap_th"]
+                    q["ng"] = q["ng"] and ends_ok and (q["rim_break"] >= p["rim_break_th"] or solid)
                 q.pop("prob", None)
 
         # 見つけた経路・U字の線を入力画像の座標に戻す（結果の描画と CSV 用）
@@ -1164,6 +1167,8 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 | end_gap_inner | 10 px | 割れが内側の端から手前で止まってよい距離 | 半割れも NG になりやすい |
 | end_gap_outer | 25 px | 割れが外側の端から手前で止まってよい距離 | 半割れも NG になりやすい |
 | rim_break_th | 0.30 | D: 起点で U字の縁取りが切れている度合いの下限 | 過検出が減り、見逃しが増える |
+| b_ratio_th | 0.20 | B: ratio_th の明るい割れ用（リブの反射を除くため厳しく） | 見逃しが減り、過検出が増える |
+| solid_ratio_th / solid_gap_th | 0.08 / 10 px | D: 縁取りの途切れが弱くても、ここまでつながった割れ線なら NG | 見逃しが減り、過検出が増える |
 | reach_th | 0.90 | B: 漏れた光が開口部までつながっている割合の下限 | 過検出が減り、見逃しが増える |
 | hug_max | 0.6 | 経路が縁・縦リブにぴったり沿っている割合の上限（溝や影を除く） | 過検出が増える |
 | up_max | 40 px | 終点が起点よりこれ以上上なら割れとみなさない | 過検出が増える |
@@ -1194,8 +1199,11 @@ python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out -
 | evaluate.py | 正解CSVとの比較 |
 | screen_crop.py | （テスト用）画面撮影写真の切り出し |
 
+## 確認済み（画面撮影の画像）
+- OK 94枚: すべて OK（過検出 0）
+- NG 20枚: 19枚 NG、位置も一致。見逃し 1枚（No.16 の中央の細い線）
+
 ## 未確認のこと
-- OK画像での過検出率（OK画像で回していない）
 - 実画像での動作（テストは画面をスマホで撮った写真で実施）
 '''
 FILES['requirements.txt'] = r'''# 動作確認済み: Python 3.12 / opencv 4.9.0 / numpy 1.26.4 / numba 0.60.0
