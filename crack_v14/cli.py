@@ -1,6 +1,7 @@
 """検査の実行。
 
   python -m crack_v14.cli --input <画像フォルダ> --out out
+  python -m crack_v14.cli --input <動画ファイル> --out out --every 1     # 動画なら1秒ごとに1コマ検査
 
 基準画像・テンプレート・設定ファイルは不要（U字は1枚ごとに自動で見つける）。
 
@@ -26,9 +27,43 @@ from .screen_crop import crop_screen
 COLORS = {"B": (255, 200, 0), "D": (0, 0, 255)}   # BGR: B は水色、D は赤
 
 
+VIDEO_EXT = (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v")
+
+
+def iter_inputs(path, every):
+    """検査する画像を (名前, 画像) の順に返す。
+
+    path が画像フォルダなら中の画像を全部、動画ファイルなら every 秒ごとに1コマを取り出す
+    （動画のコマの名前は「動画名_t012.5s」のように、何秒目かが分かるようにする）。
+    """
+    if os.path.isfile(path) and path.lower().endswith(VIDEO_EXT):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise SystemExit(f"動画が開けません: {path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        step = max(1, int(round(fps * every)))
+        base = os.path.splitext(os.path.basename(path))[0]
+        i = 0
+        while True:
+            ok, img = cap.read()
+            if not ok:
+                break
+            if i % step == 0:
+                yield f"{base}_t{i / fps:06.1f}s", img
+            i += 1
+        cap.release()
+        return
+    files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(path, f"*.{e}")))
+    for f in files:
+        img = cv2.imread(f)
+        if img is not None:
+            yield os.path.splitext(os.path.basename(f))[0], img
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="検査する画像のフォルダ")
+    ap.add_argument("--input", required=True, help="検査する画像のフォルダ、または動画ファイル")
+    ap.add_argument("--every", type=float, default=1.0, help="動画のとき、何秒ごとに1コマ検査するか")
     ap.add_argument("--out", default="out")
     ap.add_argument("--template", default=None, help="（互換のため受け付けるが、使わない）")
     ap.add_argument("--ref-dir", default=None, help="（互換のため受け付けるが、使わない）")
@@ -37,12 +72,10 @@ def main():
 
     ins = Inspector()
     os.makedirs(a.out, exist_ok=True)
-    files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
+    items = list(iter_inputs(a.input, a.every))
 
     rows, summary, tiles = [], [], []
-    for f in files:
-        name = os.path.splitext(os.path.basename(f))[0]
-        img = cv2.imread(f)
+    for name, img in items:
         if a.screen:
             img = crop_screen(img)
         r = ins.inspect(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
@@ -95,6 +128,11 @@ def main():
         w.writerow(["img", "type", "rank", "ratio", "max_gap", "inner_gap", "outer_gap",
                     "rim_break", "reach", "ng", "x1", "y1", "x2", "y2"])
         w.writerows(rows)
+    n_ng = sum(1 for r in summary if r[1] == "NG")
+    n_err = sum(1 for r in summary if r[1] == "ERROR")
+    print(f"\n合計 {len(summary)} 枚: NG {n_ng} / OK {len(summary) - n_ng - n_err} / ERROR {n_err}")
+    if n_ng:
+        print("NG になった画像: " + " ".join(r[0] for r in summary if r[1] == "NG"))
     with open(os.path.join(a.out, "judgments.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["img", "judgment", "type", "n_defects"])

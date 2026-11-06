@@ -43,6 +43,7 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 ```
 pip install -r requirements.txt
 python -m crack_v14.cli --input <画像フォルダ> --out out
+python -m crack_v14.cli --input <動画ファイル> --out out --every 1      # 動画は1秒ごとに1コマ検査
 python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out --role VALIDATION
 ```
 出力画像には、見つけた割れ（水色 = B、赤 = D）に加えて、見つけた U字の縁取り（細い緑）と
