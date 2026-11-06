@@ -1022,6 +1022,10 @@ FILES['crack_v14/make_ref.py'] = r'''"""OK画像のフォルダから、検査�
      すでに refs/ に基準画像があれば、似ている方の名前を引き継ぐ
   3. 種類ごとに、全部を重ねた画素ごとの中央値を基準画像 ref_<種類>.png にする
   4. テンプレートの位置などを info_<種類>.json に保存する
+
+作り直し: 検査のたびに作る必要はない（cli は refs/ を読むだけ）。
+  カメラや治具を動かした、照明を変えた、新しい種類が増えた、OK画像を増やしたいときだけ実行する。
+  同じ --out に作り直すと、基準画像と info は上書きされ、検査範囲の線（geom_*.json）はそのまま残る。
 """
 import argparse
 import glob
@@ -1071,9 +1075,19 @@ def main():
     aligner = TemplateAligner(load_gray(a.template))
 
     # ---- 1. 位置補正。先頭の画像のテンプレート位置を基準にする
+    #      ただし、すでに refs/ に基準があるときはその位置を引き継ぐ（作り直しても検査範囲の線がずれないように）
     g0 = load_gray(files[0])
-    tx0, ty0, s0 = aligner.locate(g0)
-    print(f"基準のテンプレート位置: ({tx0:.0f}, {ty0:.0f})  {os.path.basename(files[0])}  一致度 {s0:.2f}")
+    old_info = sorted(glob.glob(os.path.join(a.out, "info_*.json")))
+    if old_info:
+        with open(old_info[0], encoding="utf-8") as fh:
+            info0 = json.load(fh)
+        tx0, ty0 = info0["tpl_xy"]
+        sx0, sy0 = g0.shape[1] / info0["src_size"][0], g0.shape[0] / info0["src_size"][1]
+        tx0, ty0 = tx0 * sx0, ty0 * sy0
+        print(f"基準のテンプレート位置: ({tx0:.0f}, {ty0:.0f})  前回の基準から引き継ぎ")
+    else:
+        tx0, ty0, s0 = aligner.locate(g0)
+        print(f"基準のテンプレート位置: ({tx0:.0f}, {ty0:.0f})  {os.path.basename(files[0])}  一致度 {s0:.2f}")
     frames = []
     for f in files:
         g = load_gray(f)
