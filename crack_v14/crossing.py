@@ -54,7 +54,8 @@ class Crossing:
         if em > 0:
             plate = self.m["plate"].astype(np.uint8)
             ez = ~cv2.erode(plate, np.ones((2 * em + 1,) * 2, np.uint8)).astype(bool)
-            ez[-(em + 4):] = False          # 画像の下端はリブではないので除外しない
+            yb = int(max(y for _, y in geom["plate"]))
+            ez[max(0, yb - (em + 4)):] = False   # プレートの下の端はリブではないので除外しない
             self.edge_zone = ez
         else:
             self.edge_zone = np.zeros_like(self.m["plate"])

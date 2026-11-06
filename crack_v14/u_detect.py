@@ -220,6 +220,23 @@ def find_plate_edges(frame, rim, y_from):
     return out[-1][0], out[1][0], out[-1][1], out[1][1]
 
 
+def find_plate_bottom(frame, lx, rx, y_start):
+    """プレートの下の端の高さ。プレートの幅いっぱいに、横一直線のはっきりした明るさの段差がある所。
+    （カセットが画像の途中で終わっている撮り方用。見つからなければ画像の下端）"""
+    H, W = frame.shape
+    a, b = int(lx + 0.15 * (rx - lx)), int(rx - 0.15 * (rx - lx))
+    if b - a < 20:
+        return H - 1.0
+    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=5) / 16
+    strong = (np.abs(gy[:, a:b]) > 12).mean(1)                    # その行で、段差がある列の割合
+    strong = np.convolve(strong, np.ones(5) / 5, mode="same")
+    for y in range(int(y_start), H - 15):
+        if strong[y] > 0.7:
+            return float(y)
+    return H - 1.0
+
+
 def detect_geometry(frame, edge_margin=3, min_thick=40):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
@@ -245,15 +262,16 @@ def detect_geometry(frame, edge_margin=3, min_thick=40):
     else:
         lx, rx = find_ribs(frame, mid[:, 0].min(), mid[:, 0].max(), y_from)
         ox_l, ox_r = lx, rx
+    yb = find_plate_bottom(frame, lx, rx, bottom[1] + 60)          # プレートの下の端
     half = (rim[:, 0].max() - rim[:, 0].min()) / 2
     gw = max(18.0, 0.12 * half)                               # ゲートの切り欠きの範囲（U字の大きさに比例）
     g = dict(
         y_eval=int(open_top + 70),                         # 起点は y_eval-60 から = 開口部の一番上から 10px 下まで検査する
         edge_margin=edge_margin, min_thick=min_thick, rim_width=width,
         opening=[(float(rim[0][0]), 0.0)] + [tuple(map(float, p)) for p in rim] + [(float(rim[-1][0]), 0.0)],
-        plate=[(lx, 0.0), (rx, 0.0), (rx, H - 1.0), (lx, H - 1.0)],
+        plate=[(lx, 0.0), (rx, 0.0), (rx, yb), (lx, yb)],
         rim_ignore=[(float(bottom[0] - gw), float(bottom[1] - 15), float(bottom[0] + gw), float(bottom[1] + 60))],
-        outer=[[(lx + 2, 0.0), (lx + 2, H - 1.0)], [(rx - 2, 0.0), (rx - 2, H - 1.0)], [(lx, H - 3.0), (rx, H - 3.0)]],
+        outer=[[(lx + 2, 0.0), (lx + 2, yb)], [(rx - 2, 0.0), (rx - 2, yb)], [(lx, yb - 2.0), (rx, yb - 2.0)]],
         center=(float(cx), float(cy)), score=float(total),
         frame_box=(float(ox_l), float(ox_r)),
     )
@@ -271,7 +289,8 @@ def draw_geometry(frame, g):
     vis[m["outer"]] = (0, 165, 255)                  # オレンジ: 割れの終点（プレートの端）
     if "frame_box" in g:                             # 赤: カセットの外側の縁
         a_, b_ = g["frame_box"]
-        cv2.rectangle(vis, (int(a_), 1), (int(b_), vis.shape[0] - 2), (0, 0, 255), 2)
+        yb_ = int(g["plate"][2][1])
+        cv2.rectangle(vis, (int(a_), 1), (int(b_), yb_), (0, 0, 255), 2)
     for x0, y0, x1, y1 in g.get("rim_ignore", []):
         cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
     return vis

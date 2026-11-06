@@ -211,7 +211,8 @@ class Crossing:
         if em > 0:
             plate = self.m["plate"].astype(np.uint8)
             ez = ~cv2.erode(plate, np.ones((2 * em + 1,) * 2, np.uint8)).astype(bool)
-            ez[-(em + 4):] = False          # 画像の下端はリブではないので除外しない
+            yb = int(max(y for _, y in geom["plate"]))
+            ez[max(0, yb - (em + 4)):] = False   # プレートの下の端はリブではないので除外しない
             self.edge_zone = ez
         else:
             self.edge_zone = np.zeros_like(self.m["plate"])
@@ -733,7 +734,7 @@ from .u_detect import detect_geometry
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
     ratio_th=0.35,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ）
-    b_ratio_th=0.20,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
+    b_ratio_th=0.50,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
     end_gap_inner=15.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
@@ -885,6 +886,110 @@ def crop_screen(im, W=960, H=660):
         src = np.float32([[x, y], [x + w, y], [x + w, y + hh], [x, y + hh]])
     M = cv2.getPerspectiveTransform(src, np.float32([[0, 0], [W, 0], [W, H], [0, H]]))
     return cv2.warpPerspective(im, M, (W, H))
+'''
+FILES['crack_v14/screen_fix.py'] = r'''"""モニターをカメラで直接撮った写真を、普通の検査画像に近づける補正。
+
+  python -m crack_v14.screen_fix <入力フォルダ> <出力フォルダ> [--ref <見本の画像フォルダ>]
+
+やること:
+  1. 切り出し : 写真の中から、モニターに映っている検査画像の四角を探し、まっすぐに直して 1260x840 にする
+                （暗いモニターの枠より明るい、一番大きい四角い領域）
+  2. モアレ除去: 画面の画素とカメラの画素がずれてできる細かい縞模様を、エッジを残すぼかしで消す
+  3. 明るさ合わせ: 見本（--ref、補正済みの画像）の明るさの分布に合わせる（ヒストグラムマッチング）
+"""
+import argparse
+import glob
+import os
+
+import cv2
+import numpy as np
+
+OUT_SIZE = (1260, 840)
+
+
+def find_screen_quad(img):
+    """写真の中の、表示されている検査画像の四隅（左上, 右上, 右下, 左下）を返す。見つからなければ None。"""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    b = cv2.GaussianBlur(g, (0, 0), 6)
+    _, m = cv2.threshold(b, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)       # 明るい所 = 表示中の画像
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((41, 41), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 0.15 * img.shape[0] * img.shape[1]:
+        return None
+    hull = cv2.convexHull(c)
+    for eps in (0.01, 0.02, 0.03, 0.05):
+        ap = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
+        if len(ap) == 4:
+            p = ap.reshape(4, 2).astype(np.float32)
+            break
+    else:
+        x, y, w, h = cv2.boundingRect(c)
+        p = np.float32([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
+    s, d = p.sum(1), np.diff(p, axis=1).ravel()
+    return np.float32([p[s.argmin()], p[d.argmin()], p[s.argmax()], p[d.argmax()]])
+
+
+def demoire(img):
+    """細かい縞（モアレ）を消す。エッジ（割れ線・縁取り）は残す。"""
+    x = cv2.bilateralFilter(img, 9, 40, 7)
+    return cv2.medianBlur(x, 3)
+
+
+def match_histogram(img, ref_cdf):
+    """明るさの分布を見本（ref_cdf: 0〜255 の累積分布）に合わせる。"""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    cdf = np.cumsum(np.bincount(g.ravel(), minlength=256)).astype(np.float64)
+    cdf /= cdf[-1]
+    lut = np.interp(cdf, ref_cdf, np.arange(256)).clip(0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.LUT(g, lut), cv2.COLOR_GRAY2BGR)
+
+
+def reference_cdf(folder, n=20):
+    """見本フォルダの画像の、明るさの累積分布の平均。"""
+    fs = sorted(f for e in ("png", "jpg", "jpeg") for f in glob.glob(os.path.join(folder, f"*.{e}")))[:n]
+    h = np.zeros(256)
+    for f in fs:
+        g = cv2.imread(f, 0)
+        if g is not None:
+            h += np.bincount(g.ravel(), minlength=256) / g.size
+    c = np.cumsum(h)
+    return c / c[-1] if c[-1] > 0 else None
+
+
+def fix(img, ref_cdf=None):
+    q = find_screen_quad(img)
+    if q is None:
+        return None
+    M = cv2.getPerspectiveTransform(q, np.float32([[0, 0], [OUT_SIZE[0], 0], [OUT_SIZE[0], OUT_SIZE[1]], [0, OUT_SIZE[1]]]))
+    out = cv2.warpPerspective(img, M, OUT_SIZE, flags=cv2.INTER_AREA)
+    out = demoire(out)
+    if ref_cdf is not None:
+        out = match_histogram(out, ref_cdf)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("src")
+    ap.add_argument("dst")
+    ap.add_argument("--ref", default=None, help="明るさを合わせる見本（補正済み画像のフォルダ）")
+    a = ap.parse_args()
+    os.makedirs(a.dst, exist_ok=True)
+    ref = reference_cdf(a.ref) if a.ref else None
+    for f in sorted(f for e in ("png", "jpg", "jpeg") for f in glob.glob(os.path.join(a.src, f"*.{e}"))):
+        out = fix(cv2.imread(f), ref)
+        name = os.path.splitext(os.path.basename(f))[0] + ".png"
+        if out is None:
+            print(f"{name}: 画面が見つからないので飛ばします"); continue
+        cv2.imwrite(os.path.join(a.dst, name), out)
+        print(f"{name}: 補正しました")
+
+
+if __name__ == "__main__":
+    main()
 '''
 FILES['crack_v14/shrink_video.py'] = r'''"""動画を小さくする（共有用）。ffmpeg が無くても OpenCV だけで動く。
 
@@ -1155,6 +1260,23 @@ def find_plate_edges(frame, rim, y_from):
     return out[-1][0], out[1][0], out[-1][1], out[1][1]
 
 
+def find_plate_bottom(frame, lx, rx, y_start):
+    """プレートの下の端の高さ。プレートの幅いっぱいに、横一直線のはっきりした明るさの段差がある所。
+    （カセットが画像の途中で終わっている撮り方用。見つからなければ画像の下端）"""
+    H, W = frame.shape
+    a, b = int(lx + 0.15 * (rx - lx)), int(rx - 0.15 * (rx - lx))
+    if b - a < 20:
+        return H - 1.0
+    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=5) / 16
+    strong = (np.abs(gy[:, a:b]) > 12).mean(1)                    # その行で、段差がある列の割合
+    strong = np.convolve(strong, np.ones(5) / 5, mode="same")
+    for y in range(int(y_start), H - 15):
+        if strong[y] > 0.7:
+            return float(y)
+    return H - 1.0
+
+
 def detect_geometry(frame, edge_margin=3, min_thick=40):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
@@ -1180,15 +1302,16 @@ def detect_geometry(frame, edge_margin=3, min_thick=40):
     else:
         lx, rx = find_ribs(frame, mid[:, 0].min(), mid[:, 0].max(), y_from)
         ox_l, ox_r = lx, rx
+    yb = find_plate_bottom(frame, lx, rx, bottom[1] + 60)          # プレートの下の端
     half = (rim[:, 0].max() - rim[:, 0].min()) / 2
     gw = max(18.0, 0.12 * half)                               # ゲートの切り欠きの範囲（U字の大きさに比例）
     g = dict(
         y_eval=int(open_top + 70),                         # 起点は y_eval-60 から = 開口部の一番上から 10px 下まで検査する
         edge_margin=edge_margin, min_thick=min_thick, rim_width=width,
         opening=[(float(rim[0][0]), 0.0)] + [tuple(map(float, p)) for p in rim] + [(float(rim[-1][0]), 0.0)],
-        plate=[(lx, 0.0), (rx, 0.0), (rx, H - 1.0), (lx, H - 1.0)],
+        plate=[(lx, 0.0), (rx, 0.0), (rx, yb), (lx, yb)],
         rim_ignore=[(float(bottom[0] - gw), float(bottom[1] - 15), float(bottom[0] + gw), float(bottom[1] + 60))],
-        outer=[[(lx + 2, 0.0), (lx + 2, H - 1.0)], [(rx - 2, 0.0), (rx - 2, H - 1.0)], [(lx, H - 3.0), (rx, H - 3.0)]],
+        outer=[[(lx + 2, 0.0), (lx + 2, yb)], [(rx - 2, 0.0), (rx - 2, yb)], [(lx, yb - 2.0), (rx, yb - 2.0)]],
         center=(float(cx), float(cy)), score=float(total),
         frame_box=(float(ox_l), float(ox_r)),
     )
@@ -1206,7 +1329,8 @@ def draw_geometry(frame, g):
     vis[m["outer"]] = (0, 165, 255)                  # オレンジ: 割れの終点（プレートの端）
     if "frame_box" in g:                             # 赤: カセットの外側の縁
         a_, b_ = g["frame_box"]
-        cv2.rectangle(vis, (int(a_), 1), (int(b_), vis.shape[0] - 2), (0, 0, 255), 2)
+        yb_ = int(g["plate"][2][1])
+        cv2.rectangle(vis, (int(a_), 1), (int(b_), yb_), (0, 0, 255), 2)
     for x0, y0, x1, y1 in g.get("rim_ignore", []):
         cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
     return vis
