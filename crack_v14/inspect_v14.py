@@ -20,7 +20,8 @@ from .u_detect import detect_geometry
 
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
-    ratio_th=0.35,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」
+    ratio_th=0.35,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ）
+    b_ratio_th=0.20,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
     end_gap_inner=10.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
@@ -79,7 +80,7 @@ class Inspector:
         pd = to_prob(dark_line_map(frame, band), p["d_lo"], p["d_hi"])
         if lit:
             pb = to_prob(bright_gap_map(frame, band), p["b_lo"], p["b_hi"])
-            res["B"] = cr.run_multi(pb, ratio_th=p["ratio_th"], gap_th=p["gap_th"], reject=reject)
+            res["B"] = cr.run_multi(pb, ratio_th=p["b_ratio_th"], gap_th=p["gap_th"], reject=reject)
             # 明るい割れのふちの暗い所を、別の暗い割れとして数えない
             near_b = cv2.dilate((pb > 0.3).astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
             pd = np.where(near_b, 0.0, pd)
