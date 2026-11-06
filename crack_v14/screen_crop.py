@@ -3,8 +3,12 @@ import cv2, numpy as np
 
 def crop_screen(im, W=960, H=660):
     g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-    h = g.shape[0]
-    g2 = g.copy(); g2[: int(h * 0.31)] = 0; g2[int(h * 0.81):] = 0   # スマホの上のバーと下のサムネイルを除く
+    h, w = g.shape
+    g2 = g.copy()
+    if h > w:   # 縦向きのスマホのスクショ: 上のバーと下のサムネイルを除く
+        g2[: int(h * 0.31)] = 0; g2[int(h * 0.81):] = 0
+    else:       # 横向き（モニターを撮った動画など）: 端の 3% だけ除く
+        g2[: int(h * 0.03)] = 0; g2[int(h * 0.97):] = 0; g2[:, : int(w * 0.03)] = 0; g2[:, int(w * 0.97):] = 0
     m = (cv2.GaussianBlur(g2, (0, 0), 5) > 45).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
     n, lab, st, _ = cv2.connectedComponentsWithStats(m)

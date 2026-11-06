@@ -124,6 +124,8 @@ def main():
 
         cv2.putText(vis, f"{name} {r['judgment']}", (10, 14 * lw), 0, 0.4 * lw, (0, 255, 255), lw)
         cv2.imwrite(os.path.join(a.out, f"{name}.jpg"), vis)
+        if a.screen and len(summary) == 1:
+            print(f"  （確認用）1枚目の切り出し結果: {os.path.join(a.out, name + '.jpg')} を見て、画面が正しく切り出せているか確認してください")
         t_ = cv2.resize(vis, (480, round(480 * vis.shape[0] / vis.shape[1])))
         tile = np.zeros((360, 480, 3), np.uint8)
         tile[: min(360, t_.shape[0])] = t_[:360]
@@ -779,8 +781,12 @@ import cv2, numpy as np
 
 def crop_screen(im, W=960, H=660):
     g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-    h = g.shape[0]
-    g2 = g.copy(); g2[: int(h * 0.31)] = 0; g2[int(h * 0.81):] = 0   # スマホの上のバーと下のサムネイルを除く
+    h, w = g.shape
+    g2 = g.copy()
+    if h > w:   # 縦向きのスマホのスクショ: 上のバーと下のサムネイルを除く
+        g2[: int(h * 0.31)] = 0; g2[int(h * 0.81):] = 0
+    else:       # 横向き（モニターを撮った動画など）: 端の 3% だけ除く
+        g2[: int(h * 0.03)] = 0; g2[int(h * 0.97):] = 0; g2[:, : int(w * 0.03)] = 0; g2[:, int(w * 0.97):] = 0
     m = (cv2.GaussianBlur(g2, (0, 0), 5) > 45).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
     n, lab, st, _ = cv2.connectedComponentsWithStats(m)

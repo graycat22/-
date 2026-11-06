@@ -113,6 +113,8 @@ def main():
 
         cv2.putText(vis, f"{name} {r['judgment']}", (10, 14 * lw), 0, 0.4 * lw, (0, 255, 255), lw)
         cv2.imwrite(os.path.join(a.out, f"{name}.jpg"), vis)
+        if a.screen and len(summary) == 1:
+            print(f"  （確認用）1枚目の切り出し結果: {os.path.join(a.out, name + '.jpg')} を見て、画面が正しく切り出せているか確認してください")
         t_ = cv2.resize(vis, (480, round(480 * vis.shape[0] / vis.shape[1])))
         tile = np.zeros((360, 480, 3), np.uint8)
         tile[: min(360, t_.shape[0])] = t_[:360]
