@@ -21,7 +21,7 @@ from .u_detect import detect_geometry
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
     ratio_th=0.30,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ。本物は最大 0.25、OK品の傷は 0.31〜）
-    b_ratio_th=0.50,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
+    b_ratio_th=0.42,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（実画像の本物は最大 0.38、OK品の反射は 0.48〜）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
     end_gap_inner=15.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
@@ -166,8 +166,8 @@ class Inspector:
                     defects.append(dict(type=t, bbox=(int(x1), int(y1), int(x2), int(y2))))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
         u_img = dict(rim=back(geom["opening"][1:-1]), ribs=[back(line) for line in geom["outer"][:2]])
-        if "frame_box" in geom:                                  # カセットの外側の縁（確認用の赤い枠）
-            a_, b_ = geom["frame_box"]; yb_ = max(y for _, y in geom["plate"])
-            u_img["frame"] = back([(a_, 0), (b_, 0), (b_, yb_), (a_, yb_), (a_, 0)])
+        if "frame_poly" in geom:                                 # カセットの外側の縁（確認用の赤い枠）
+            fp = geom["frame_poly"]
+            u_img["frame"] = back(fp + [fp[0]])
         return dict(kind="auto", backlit=lit, u_score=uscore, geom=geom, u_img=u_img, M=M, frame=frame,
                     res=res, judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))

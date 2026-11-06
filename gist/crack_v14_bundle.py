@@ -741,7 +741,7 @@ from .u_detect import detect_geometry
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
     ratio_th=0.30,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ。本物は最大 0.25、OK品の傷は 0.31〜）
-    b_ratio_th=0.50,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
+    b_ratio_th=0.42,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（実画像の本物は最大 0.38、OK品の反射は 0.48〜）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
     end_gap_inner=15.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
@@ -886,9 +886,9 @@ class Inspector:
                     defects.append(dict(type=t, bbox=(int(x1), int(y1), int(x2), int(y2))))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
         u_img = dict(rim=back(geom["opening"][1:-1]), ribs=[back(line) for line in geom["outer"][:2]])
-        if "frame_box" in geom:                                  # カセットの外側の縁（確認用の赤い枠）
-            a_, b_ = geom["frame_box"]; yb_ = max(y for _, y in geom["plate"])
-            u_img["frame"] = back([(a_, 0), (b_, 0), (b_, yb_), (a_, yb_), (a_, 0)])
+        if "frame_poly" in geom:                                 # カセットの外側の縁（確認用の赤い枠）
+            fp = geom["frame_poly"]
+            u_img["frame"] = back(fp + [fp[0]])
         return dict(kind="auto", backlit=lit, u_score=uscore, geom=geom, u_img=u_img, M=M, frame=frame,
                     res=res, judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))
 '''
@@ -1294,6 +1294,33 @@ def find_plate_edges(frame, rim, y_from):
     return out[-1][0], out[1][0], out[-1][1], out[1][1]
 
 
+def fit_tilt(frame, x0, side, y_top, y_bot, win=14, max_slope=0.06):
+    """縦の境目（外へ向かって暗くなる段差）を、少し傾いた直線として探す。
+    写真がわずかに斜め・ハの字のときに、プレートの端や外側の縁を正しく追うため。
+
+    x0 を通る縦線の近く（±win px）で、傾き（±max_slope）と位置を色々試し、
+    線の上全体で「外へ向かって暗くなる強さ」の平均がいちばん大きい直線を選ぶ（ハフ変換と同じ考え方）。
+    戻り値: (y=0 での x, 傾き b)
+    """
+    H, W = frame.shape
+    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    g = -side * cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=5) / 16      # 外へ向かって暗くなると +
+    ys = np.arange(int(y_top), int(y_bot), 2, dtype=np.float32)
+    if len(ys) < 10:
+        return float(x0), 0.0
+    yc = float(ys.mean())
+    best = (-1e9, float(x0), 0.0)
+    for b in np.linspace(-max_slope, max_slope, 25):
+        for dx in range(-win, win + 1):
+            xs = (x0 + dx + b * (ys - yc)).astype(np.float32)
+            v = cv2.remap(g, xs.reshape(1, -1), ys.reshape(1, -1), cv2.INTER_LINEAR)
+            sc = float(np.mean(np.clip(v, -30, 30))) - 0.5 * abs(b) * 100 / 6    # 傾けすぎにはわずかに減点
+            if sc > best[0]:
+                best = (sc, float(x0 + dx), float(b))
+    _, xc, b = best
+    return xc - b * yc, b
+
+
 def find_plate_bottom(frame, lx, rx, y_start):
     """プレートの下の端の高さ。プレートの幅いっぱいに、横一直線のはっきりした明るさの段差がある所。
     （カセットが画像の途中で終わっている撮り方用。見つからなければ画像の下端）"""
@@ -1366,17 +1393,26 @@ def detect_geometry(frame, edge_margin=3, min_thick=40):
         lx, rx = find_ribs(frame, mid[:, 0].min(), mid[:, 0].max(), y_from)
         ox_l, ox_r = lx, rx
     yb = find_plate_bottom(frame, lx, rx, bottom[1] + 60)          # プレートの下の端
+    # 左右の端を、高さごとに測って少し傾いた直線にする（写真の傾き・ハの字に合わせる）
+    yt = max(0.0, open_top)
+    la, lb = fit_tilt(frame, lx, -1, yt, yb)
+    ra, rb = fit_tilt(frame, rx, +1, yt, yb)
+    oa, ob = fit_tilt(frame, ox_l, -1, yt, yb)
+    pa, pb_ = fit_tilt(frame, ox_r, +1, yt, yb)
+    X = lambda a_, b_, y: float(a_ + b_ * y)
     half = (rim[:, 0].max() - rim[:, 0].min()) / 2
     gw = max(18.0, 0.12 * half)                               # ゲートの切り欠きの範囲（U字の大きさに比例）
     g = dict(
         y_eval=int(open_top + 70),                         # 起点は y_eval-60 から = 開口部の一番上から 10px 下まで検査する
         edge_margin=edge_margin, min_thick=min_thick, rim_width=width,
         opening=[(float(rim[0][0]), 0.0)] + [tuple(map(float, p)) for p in rim] + [(float(rim[-1][0]), 0.0)],
-        plate=[(lx, 0.0), (rx, 0.0), (rx, yb), (lx, yb)],
+        plate=[(X(la, lb, 0), 0.0), (X(ra, rb, 0), 0.0), (X(ra, rb, yb), yb), (X(la, lb, yb), yb)],
         rim_ignore=[(float(bottom[0] - gw), float(bottom[1] - 15), float(bottom[0] + gw), float(bottom[1] + 60))],
-        outer=[[(lx + 2, 0.0), (lx + 2, yb)], [(rx - 2, 0.0), (rx - 2, yb)], [(lx, yb - 2.0), (rx, yb - 2.0)]],
+        outer=[[(X(la, lb, 0) + 2, 0.0), (X(la, lb, yb) + 2, yb)], [(X(ra, rb, 0) - 2, 0.0), (X(ra, rb, yb) - 2, yb)],
+               [(X(la, lb, yb), yb - 2.0), (X(ra, rb, yb), yb - 2.0)]],
         center=(float(cx), float(cy)), score=float(total),
         frame_box=(float(ox_l), float(ox_r)),
+        frame_poly=[(X(oa, ob, 0), 0.0), (X(pa, pb_, 0), 0.0), (X(pa, pb_, yb), yb), (X(oa, ob, yb), yb)],
     )
     return g, float(total)
 
@@ -1390,10 +1426,8 @@ def draw_geometry(frame, g):
     vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
     vis[m["inner"]] = (0, 220, 0)
     vis[m["outer"]] = (0, 165, 255)                  # オレンジ: 割れの終点（プレートの端）
-    if "frame_box" in g:                             # 赤: カセットの外側の縁
-        a_, b_ = g["frame_box"]
-        yb_ = int(g["plate"][2][1])
-        cv2.rectangle(vis, (int(a_), 1), (int(b_), yb_), (0, 0, 255), 2)
+    if "frame_poly" in g:                            # 赤: カセットの外側の縁
+        cv2.polylines(vis, [np.round(np.array(g["frame_poly"])).astype(np.int32)], True, (0, 0, 255), 2)
     for x0, y0, x1, y1 in g.get("rim_ignore", []):
         cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
     return vis
