@@ -60,30 +60,36 @@ class Inspector:
         band = cr.m["band"]
         res = {}
 
+        # 縁・縦リブからの距離（縁や縦リブに沿って走る溝・影を見分けるため）
+        dist = cv2.distanceTransform((~cr.m["opening"]).astype(np.uint8), cv2.DIST_L2, 5)   # U字の縁からの距離
+        dist_rib = cv2.distanceTransform(cr.m["plate"].astype(np.uint8), cv2.DIST_L2, 5)     # 縦リブからの距離
+        hug_d = 1.5 * geom.get("rim_width", 16) + 10
+
+        def hug(q):
+            """経路のうち、縁や縦リブにぴったり沿っている割合"""
+            P = q["path"]
+            return float(max((dist[P[:, 0], P[:, 1]] < hug_d).mean(), (dist_rib[P[:, 0], P[:, 1]] < 25).mean()))
+
+        def reject(q):
+            """割れではない道: 大部分が縁・縦リブに沿っている、または終点が起点よりかなり上（脚の溝を上へ這う）"""
+            return hug(q) > p["hug_max"] or q["path"][0, 0] - q["path"][-1, 0] > p["up_max"]
+
         # 3-5. 背面光 -> 割れらしさ -> 経路探索
         lit = is_backlit(frame, cr.m["opening"])
         pd = to_prob(dark_line_map(frame, band), p["d_lo"], p["d_hi"])
         if lit:
             pb = to_prob(bright_gap_map(frame, band), p["b_lo"], p["b_hi"])
-            res["B"] = cr.run_multi(pb, ratio_th=p["ratio_th"], gap_th=p["gap_th"])
+            res["B"] = cr.run_multi(pb, ratio_th=p["ratio_th"], gap_th=p["gap_th"], reject=reject)
             # 明るい割れのふちの暗い所を、別の暗い割れとして数えない
             near_b = cv2.dilate((pb > 0.3).astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
             pd = np.where(near_b, 0.0, pd)
-        res["D"] = cr.run_multi(pd, ratio_th=p["ratio_th"], gap_th=p["gap_th"])
+        res["D"] = cr.run_multi(pd, ratio_th=p["ratio_th"], gap_th=p["gap_th"], reject=reject)
 
         # 6. 割れの定義に合うか
-        # 縁からの距離（縁に沿って走る溝・影を見分けるため）
-        dist = cv2.distanceTransform((~cr.m["opening"]).astype(np.uint8), cv2.DIST_L2, 5)   # U字の縁からの距離
-        dist_rib = cv2.distanceTransform(cr.m["plate"].astype(np.uint8), cv2.DIST_L2, 5)     # 縦リブ（プレートの端）からの距離
-        hug_d = 1.5 * geom.get("rim_width", 16) + 10
         for t, cands in res.items():
             for q in cands:
-                P = q["path"]
-                # 割れは縁から離れる方向に横切る。経路の大部分が縁や縦リブにぴったり沿っていたら、溝や影
-                q["hug"] = float(max((dist[P[:, 0], P[:, 1]] < hug_d).mean(),
-                                     (dist_rib[P[:, 0], P[:, 1]] < 25).mean()))
-                rises = P[0, 0] - P[-1, 0] > p["up_max"]          # 終点が起点よりかなり上
-                if q["hug"] > p["hug_max"] or rises:
+                q["hug"] = hug(q)
+                if reject(q):
                     q["ng"] = False
                 start = q["path"][0][::-1].astype(np.float32)          # 起点 (x, y)
                 ends_ok = q["inner_gap"] <= p["end_gap_inner"] and q["outer_gap"] <= p["end_gap_outer"]

@@ -75,8 +75,8 @@ class Crossing:
         self.rim_pts, self.rim_nrm, self.rim_depth = c, nrm, depth
 
     def rim_profile(self, gray):
-        """輪郭の各点で、縁取りを横切る方向に明るさを測り、縁取りの明るさ（縁取りの太さの範囲で上位15%の値）を返す。"""
-        d = np.arange(-2, self.rim_depth + 1)
+        """輪郭の各点で、縁取りを横切る方向（線の前後 8px）に明るさを測り、縁取りの明るさ（上位15%の値）を返す。"""
+        d = np.arange(-8, 9)          # 縁取りの線（縁取りの上にある）の前後 8px
         xy = self.rim_pts[:, None, :] + d[None, :, None] * self.rim_nrm[:, None, :]
         x = xy[..., 0].clip(0, gray.shape[1] - 1).astype(np.float32)
         y = xy[..., 1].clip(0, gray.shape[0] - 1).astype(np.float32)
@@ -145,16 +145,28 @@ class Crossing:
         return dict(ratio=float(ratio[k]), max_gap=float(gap), length=float(length), path=path,
                     inner_gap=inner_gap, outer_gap=outer_gap, prob=prob)
 
-    def run_multi(self, prob, k=3, ratio_th=0.35, gap_th=25.0, sep=35):
-        """割れが複数あるときのために、見つけた道の周り（sep px）を消して最大 k 本まで探す。"""
+    def run_multi(self, prob, k=3, ratio_th=0.35, gap_th=25.0, sep=35, reject=None, max_iter=10):
+        """割れが複数あるときのために、見つけた道の周り（sep px）を消して最大 k 本まで探す。
+
+        reject(道) が True の道（U字の縁や縦リブに沿って走る溝・影）は割れの候補にせず、
+        その道の線だけを細く（5px）消して探し直す。太く消すと、縁から始まる本物の割れの根元まで消えるため。
+        """
         out, p = [], prob.copy()
-        for _ in range(k):
+        for _ in range(max_iter):
             r = self.run(p)
             r["ng"] = r["ratio"] <= ratio_th and r["max_gap"] <= gap_th
+            line = [r["path"][:, ::-1].astype(np.int32)]
+            if r["ng"] and reject is not None and reject(r):
+                m = np.zeros(p.shape, np.uint8)
+                cv2.polylines(m, line, False, 1, 5)
+                p[m.astype(bool)] = 0.0
+                continue
             out.append(r)
-            if not r["ng"]:
+            if not r["ng"] or len(out) >= k:
                 break
             m = np.zeros(p.shape, np.uint8)
-            cv2.polylines(m, [r["path"][:, ::-1].astype(np.int32)], False, 1, 2 * sep + 1)
+            cv2.polylines(m, line, False, 1, 2 * sep + 1)
             p[m.astype(bool)] = 0.0
+        if not out:
+            out.append(r)
         return out
