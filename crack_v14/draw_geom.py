@@ -167,7 +167,23 @@ def main():
     ap.add_argument("--ref-dir", default="refs")
     ap.add_argument("--kind", default=None, help="線を引く種類（省略すると全部）")
     ap.add_argument("--no-snap", action="store_true", help="縁取りへの吸い付けをしない（クリックした所そのまま）")
+    ap.add_argument("--resnap", action="store_true",
+                    help="クリックし直さず、今ある線（geom_*.json）を縁取りの境目に吸い付け直すだけ")
     a = ap.parse_args()
+    if a.resnap:
+        from .geometry import load_geom
+        kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[5:-5] for p in glob.glob(os.path.join(a.ref_dir, "geom_*.json")))
+        for kind in kinds:
+            ref = cv2.imread(os.path.join(a.ref_dir, f"ref_{kind}.png"), 0)
+            g = load_geom(a.ref_dir, kind)
+            if ref is None or g is None:
+                print(f"[{kind}] 基準画像か線が無いので飛ばします"); continue
+            rim = g["opening"][1:-1]                     # 上端で閉じるための点を除いた、クリックした縁取りの線
+            g["opening"] = [g["opening"][0]] + snap_rim(ref, rim) + [g["opening"][-1]]
+            save_geom(a.ref_dir, kind, g)
+            cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
+            print(f"[{kind}] 線を吸い付け直しました -> {a.ref_dir}/check_{kind}.jpg")
+        return
     kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[4:-4] for p in glob.glob(os.path.join(a.ref_dir, "ref_*.png")))
     if not kinds:
         raise SystemExit(f"基準画像がありません: {a.ref_dir}（先に make_ref を実行してください）")

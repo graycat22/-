@@ -41,7 +41,10 @@ python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --ou
 python -m crack_v14.draw_geom --ref-dir refs
 #    手順: (1) U字の縁取りの外側を左の脚の上→底→右の脚の上 (2) 左の縦リブ 上下2点 (3) 右の縦リブ 上下2点
 #          (4) ゲートの切り欠きを囲む四角 2点（無ければEnter） (5) 検査を始める高さ 1点
-#    左クリック=点、右クリック=戻す、Enter=次へ。終わると refs/check_<種類>.jpg が出るので確認する
+#    左クリック=点、右クリック=戻す、Enter=次へ。大まかでよい（縁取りの境目に自動で吸い付ける）
+#    終わると refs/check_<種類>.jpg が出るので確認する
+#    すでに線があるときは、クリックし直さずに吸い付けだけやり直せる:
+python -m crack_v14.draw_geom --ref-dir refs --resnap
 
 # 3. 検査
 python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out

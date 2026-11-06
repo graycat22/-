@@ -489,7 +489,23 @@ def main():
     ap.add_argument("--ref-dir", default="refs")
     ap.add_argument("--kind", default=None, help="線を引く種類（省略すると全部）")
     ap.add_argument("--no-snap", action="store_true", help="縁取りへの吸い付けをしない（クリックした所そのまま）")
+    ap.add_argument("--resnap", action="store_true",
+                    help="クリックし直さず、今ある線（geom_*.json）を縁取りの境目に吸い付け直すだけ")
     a = ap.parse_args()
+    if a.resnap:
+        from .geometry import load_geom
+        kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[5:-5] for p in glob.glob(os.path.join(a.ref_dir, "geom_*.json")))
+        for kind in kinds:
+            ref = cv2.imread(os.path.join(a.ref_dir, f"ref_{kind}.png"), 0)
+            g = load_geom(a.ref_dir, kind)
+            if ref is None or g is None:
+                print(f"[{kind}] 基準画像か線が無いので飛ばします"); continue
+            rim = g["opening"][1:-1]                     # 上端で閉じるための点を除いた、クリックした縁取りの線
+            g["opening"] = [g["opening"][0]] + snap_rim(ref, rim) + [g["opening"][-1]]
+            save_geom(a.ref_dir, kind, g)
+            cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
+            print(f"[{kind}] 線を吸い付け直しました -> {a.ref_dir}/check_{kind}.jpg")
+        return
     kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[4:-4] for p in glob.glob(os.path.join(a.ref_dir, "ref_*.png")))
     if not kinds:
         raise SystemExit(f"基準画像がありません: {a.ref_dir}（先に make_ref を実行してください）")
@@ -1246,7 +1262,10 @@ python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --ou
 python -m crack_v14.draw_geom --ref-dir refs
 #    手順: (1) U字の縁取りの外側を左の脚の上→底→右の脚の上 (2) 左の縦リブ 上下2点 (3) 右の縦リブ 上下2点
 #          (4) ゲートの切り欠きを囲む四角 2点（無ければEnter） (5) 検査を始める高さ 1点
-#    左クリック=点、右クリック=戻す、Enter=次へ。終わると refs/check_<種類>.jpg が出るので確認する
+#    左クリック=点、右クリック=戻す、Enter=次へ。大まかでよい（縁取りの境目に自動で吸い付ける）
+#    終わると refs/check_<種類>.jpg が出るので確認する
+#    すでに線があるときは、クリックし直さずに吸い付けだけやり直せる:
+python -m crack_v14.draw_geom --ref-dir refs --resnap
 
 # 3. 検査
 python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
