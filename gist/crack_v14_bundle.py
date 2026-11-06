@@ -888,6 +888,57 @@ def trace_leg(img, edge, start, side, row_step=4, search=40, max_shift=3):
     return pts[::-1][:-1]                                         # 上端 -> start の手前（start は arc 側にある）
 
 
+def regularize(rim, cx, cy, deg=6, iters=3):
+    """見つけた縁取りの線を「綺麗なU字」に直す（ガタつき・部分的な外れを取る）。
+
+      脚（中心より上）: 左右それぞれ1本の直線に当てはめる（外れた点は除いて当てはめ直す）
+      底（中心より下）: 中心から見た距離を、角度のなめらかな関数（多項式）に当てはめる
+    """
+    rim = np.asarray(rim, np.float64)
+    legs_l = rim[(rim[:, 1] < cy) & (rim[:, 0] < cx)]
+    legs_r = rim[(rim[:, 1] < cy) & (rim[:, 0] >= cx)]
+    arc = rim[rim[:, 1] >= cy]
+
+    def robust_line(pts):                      # x = a + b*y
+        if len(pts) < 4:
+            return None
+        keep = np.ones(len(pts), bool)
+        for _ in range(iters):
+            b_, a_ = np.polyfit(pts[keep, 1], pts[keep, 0], 1)
+            res = np.abs(pts[:, 0] - (a_ + b_ * pts[:, 1]))
+            keep = res < max(3.0, 2.5 * np.median(res[keep]))
+        return a_, b_
+
+    th = np.arctan2(arc[:, 1] - cy, arc[:, 0] - cx)
+    r = np.hypot(arc[:, 0] - cx, arc[:, 1] - cy)
+    keep = np.ones(len(th), bool)
+    for _ in range(iters):
+        coef = np.polyfit(th[keep], r[keep], deg)
+        res = np.abs(r - np.polyval(coef, th))
+        keep = res < max(3.0, 2.5 * np.median(res[keep]))
+    t2 = np.linspace(th.max(), th.min(), 120)  # 左（大きい角度）-> 底 -> 右
+    a2 = np.c_[cx + np.polyval(coef, t2) * np.cos(t2), cy + np.polyval(coef, t2) * np.sin(t2)]
+
+    out = []
+    L, R = robust_line(legs_l), robust_line(legs_r)
+    # U字は左右対称なので、脚の傾きは左右で鏡写し（左の傾き = -右の傾き）にそろえ、大きく傾けない
+    if L is not None and R is not None:
+        bm = float(np.clip((L[1] - R[1]) / 2, -0.08, 0.08))
+        L, R = (L[0], bm), (R[0], -bm)
+    ys = np.arange(0, a2[0][1], 6.0)
+    if L is not None:
+        xl = L[0] + L[1] * ys
+        xl += a2[0][0] - (L[0] + L[1] * a2[0][1])     # 底とつながるように端をそろえる
+        out.append(np.c_[xl, ys])
+    out.append(a2)
+    ys = np.arange(0, a2[-1][1], 6.0)[::-1]
+    if R is not None:
+        xr = R[0] + R[1] * ys
+        xr += a2[-1][0] - (R[0] + R[1] * a2[-1][1])
+        out.append(np.c_[xr, ys])
+    return np.vstack(out)
+
+
 def snap_rim(ref, rim, search=10, step=4.0, smooth_penalty=2.0):
     """縁取りの線を、近くの本当の境目（外側の暗い樹脂 -> 内側の明るい縁取り）に細かく吸い付け、
     縁取りの太さも測る。戻り値: (点の並び, 縁取りの太さ[px])"""
@@ -940,7 +991,9 @@ def detect_geometry(frame, edge_margin=10, min_thick=30):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
     rim0, (cx, cy), total = find_rim(frame)
-    rim, width = snap_rim(frame, rim0.tolist())
+    rim0 = regularize(rim0, cx, cy)                            # 綺麗なU字に直す
+    rim, width = snap_rim(frame, rim0.tolist(), search=5, smooth_penalty=4.0)
+    rim = regularize(np.array(rim), cx, cy).tolist()          # 吸い付けたあとも、もう一度U字にそろえる
     rim = np.array(rim)
     bottom = rim[np.argmax(rim[:, 1])]
     top_y = float(rim[:, 1].min())
