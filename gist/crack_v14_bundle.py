@@ -203,7 +203,7 @@ class Crossing:
         th = cum0[ends[:, 0], ends[:, 1]]
         # 起点を縁取りの内側に置いたときは、縁取りの太さぶん厚く測れるので、その分を足して比べる
         extra = (geom.get("rim_width") or 0) + 6 if self.m["rim"].any() else 0
-        keep = (ends[:, 0] >= y0) & np.isfinite(th) & (th >= geom.get("min_thick", 60) + extra)
+        keep = (ends[:, 0] >= y0 - 60) & np.isfinite(th) & (th >= geom.get("min_thick", 60) + extra)
         self.ends, self.thick = ends[keep], th[keep]
 
         # プレートの端（縦リブの縁）は黒い線が必ずあるので、割れの証拠として数えない帯にする
@@ -802,9 +802,14 @@ class Inspector:
         if lit:
             pb = to_prob(bright_gap_map(frame, band), p["b_lo"], p["b_hi"])
             res["B"] = cr.run_multi(pb, ratio_th=p["b_ratio_th"], gap_th=p["gap_th"], reject=reject)
-            # 明るい割れのふちの暗い所を、別の暗い割れとして数えない
-            near_b = cv2.dilate((pb > 0.3).astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
-            pd = np.where(near_b, 0.0, pd)
+            # 明るい割れ（NG と判定した B の経路）のふちの暗い所を、別の暗い割れとして数えない。
+            # 明るい所全部を消すと、縁取りのハイライトの近くから始まる暗い割れまで消えてしまうので、
+            # 本当に見つかった明るい割れの周りだけを消す
+            near_b = np.zeros(pd.shape, np.uint8)
+            for q in res["B"]:
+                if q["ratio"] <= p["b_ratio_th"] and q["max_gap"] <= p["gap_th"] and not reject(q):
+                    cv2.polylines(near_b, [q["path"][:, ::-1].astype(np.int32)], False, 1, 31)
+            pd = np.where(near_b.astype(bool), 0.0, pd)
         res["D"] = cr.run_multi(pd, ratio_th=p["ratio_th"], gap_th=p["gap_th"], reject=reject)
 
         # 6. 割れの定義に合うか
@@ -1110,7 +1115,7 @@ def find_ribs(frame, left_leg, right_leg, y_from):
     return float(lx), float(rx)
 
 
-def detect_geometry(frame, edge_margin=10, min_thick=60):
+def detect_geometry(frame, edge_margin=10, min_thick=12):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
     op = find_opening(frame)                                    # U字の開口部を領域として切り出す

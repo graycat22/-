@@ -188,7 +188,7 @@ def find_ribs(frame, left_leg, right_leg, y_from):
     return float(lx), float(rx)
 
 
-def detect_geometry(frame, edge_margin=10, min_thick=60):
+def detect_geometry(frame, edge_margin=10, min_thick=12):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
     op = find_opening(frame)                                    # U字の開口部を領域として切り出す

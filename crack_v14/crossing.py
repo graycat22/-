@@ -46,7 +46,7 @@ class Crossing:
         th = cum0[ends[:, 0], ends[:, 1]]
         # 起点を縁取りの内側に置いたときは、縁取りの太さぶん厚く測れるので、その分を足して比べる
         extra = (geom.get("rim_width") or 0) + 6 if self.m["rim"].any() else 0
-        keep = (ends[:, 0] >= y0) & np.isfinite(th) & (th >= geom.get("min_thick", 60) + extra)
+        keep = (ends[:, 0] >= y0 - 60) & np.isfinite(th) & (th >= geom.get("min_thick", 60) + extra)
         self.ends, self.thick = ends[keep], th[keep]
 
         # プレートの端（縦リブの縁）は黒い線が必ずあるので、割れの証拠として数えない帯にする

@@ -90,9 +90,14 @@ class Inspector:
         if lit:
             pb = to_prob(bright_gap_map(frame, band), p["b_lo"], p["b_hi"])
             res["B"] = cr.run_multi(pb, ratio_th=p["b_ratio_th"], gap_th=p["gap_th"], reject=reject)
-            # 明るい割れのふちの暗い所を、別の暗い割れとして数えない
-            near_b = cv2.dilate((pb > 0.3).astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
-            pd = np.where(near_b, 0.0, pd)
+            # 明るい割れ（NG と判定した B の経路）のふちの暗い所を、別の暗い割れとして数えない。
+            # 明るい所全部を消すと、縁取りのハイライトの近くから始まる暗い割れまで消えてしまうので、
+            # 本当に見つかった明るい割れの周りだけを消す
+            near_b = np.zeros(pd.shape, np.uint8)
+            for q in res["B"]:
+                if q["ratio"] <= p["b_ratio_th"] and q["max_gap"] <= p["gap_th"] and not reject(q):
+                    cv2.polylines(near_b, [q["path"][:, ::-1].astype(np.int32)], False, 1, 31)
+            pd = np.where(near_b.astype(bool), 0.0, pd)
         res["D"] = cr.run_multi(pd, ratio_th=p["ratio_th"], gap_th=p["gap_th"], reject=reject)
 
         # 6. 割れの定義に合うか
