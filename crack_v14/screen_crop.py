@@ -1,10 +1,10 @@
-"""Cut the monitor area out of a phone photo of the screen (only for the screen-photo test set)."""
+"""（テスト用）モニターをスマホで撮った写真から、画面の部分だけを切り出して 960x660 にする。本番では使わない。"""
 import cv2, numpy as np
 
 def crop_screen(im, W=960, H=660):
     g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
     h = g.shape[0]
-    g2 = g.copy(); g2[: int(h * 0.31)] = 0; g2[int(h * 0.81):] = 0   # status bar / thumbnails
+    g2 = g.copy(); g2[: int(h * 0.31)] = 0; g2[int(h * 0.81):] = 0   # スマホの上のバーと下のサムネイルを除く
     m = (cv2.GaussianBlur(g2, (0, 0), 5) > 45).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
     n, lab, st, _ = cv2.connectedComponentsWithStats(m)

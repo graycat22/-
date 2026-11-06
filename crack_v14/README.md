@@ -1,89 +1,69 @@
-# カセットワレ検査 V14（横断経路方式）
+# カセットワレ検査 V14
 
-## 考え方
-割れ = 「U字内縁 → 外縁（左右リブ／下端）を、割れらしい画素だけを通って抜けられる経路」。
-画像上で最小コスト経路（MCP / Dijkstra）を1回解き、
+## 割れの定義
+U字の内側（開口部）から外縁（左右の縦リブ・下端）まで、**端から端まで割れているもの**だけを NG にする。
+途中で止まっている半割れ・表面の傷・成形線・影は OK。
 
-- `ratio`   = 経路上で健全部を通らされた長さ ÷ その位置の健全な肉厚（0=端から端まで割れ、1=健全）
-- `max_gap` = 経路上で割れらしくない区間の最長連続長 [px]
+- **B** = 明るい割れ（割れ目から背面光が漏れて白く見える）。背面光がある画像だけ検査
+- **D** = 暗い割れ（黒い割れ線）。全部の画像で検査
+- **製品の種類** = type1（U字の脚が上まで長く見える）/ type2（U字の内側にネジ筒が見える）
 
-- `rim_break` = 経路の起点で U字内縁の白い縁取りがどれだけ途切れているか（0=無傷、1=完全に切れている）
+## 処理の流れ（inspect_v14.py）
+1. **位置合わせ**: `template_table1.png`（右側のネジ2つと留め具）を `cv2.matchTemplate` で探し、X・Y のずれを補正して 960x660 に縮小（align.py）
+2. **種類の判定**: type1・type2 の基準画像と輪郭を比べ、よく合う方にする（明るさは使わない）
+3. **背面光の判定**: U字の開口部が明るいか
+4. **割れらしさ**: 画素ごとに割れっぽさを 0〜1 で数値化（features.py）
+   - D: 周りより暗く、細長い所
+   - B: 周りの樹脂より明るい所
+5. **経路探索**: 内縁から外縁まで、割れっぽい所だけを通って抜けられる道を探す（crossing.py, geodesic.py）
+6. **判定**: 下の条件を全部満たす道があれば NG
 
-- `inner_gap / outer_gap` = 割れが内側・外側の端からどれだけ手前で止まっているか [px]
-- `reach` = (B) 漏れた光が縁取りを越えて U字の開口部までつながっているか
+## 判定の条件と閾値（inspect_v14.py の PARAMS）
+| 閾値 | 値 | 意味 | 上げると |
+|---|---|---|---|
+| ratio_th | 0.35 | 道の上で割れていない所を通った割合の上限 | 見逃しが減り、過検出が増える |
+| gap_th | 25 px | 割れていない区間の最長の上限 | 見逃しが減り、過検出が増える |
+| end_gap_inner | 10 px | 割れが内側の端から手前で止まってよい距離 | 半割れも NG になりやすい |
+| end_gap_outer | 25 px | 割れが外側の端から手前で止まってよい距離 | 半割れも NG になりやすい |
+| rim_break_th | 0.30 | D: 起点で U字の縁取りが切れている度合いの下限 | 過検出が減り、見逃しが増える |
+| reach_th | 0.90 | B: 漏れた光が開口部までつながっている割合の下限 | 過検出が減り、見逃しが増える |
+| d_lo / d_hi | 0.10 / 0.30 | D: 暗さ（×細長さ）を割れらしさ 0〜1 にする範囲 | 薄い線を拾いにくくなる |
+| b_lo / b_hi | 2.5 / 6.0 | B: 明るさを割れらしさ 0〜1 にする範囲 | 淡い光漏れを拾いにくくなる |
 
-割れの定義は「U字の内側（開口部）から外縁まで、端から端まで割れている」こと。半割れは OK。
-- 共通: `inner_gap<=10 AND outer_gap<=25`（両端まで割れが届いている）
-- B-NG: `ratio<=0.35 AND max_gap<=25 AND reach>=0.9`
-- D-NG: 上記 `AND rim_break>=0.30`
-  （人間の判断と同じ: 本当にパックリ割れていれば縁取りが切れる。傷・成形線・影は縁取りを切らない。
-  ゲート切り欠きの位置は `rim_ignore` で除外）
-3帯域支持・gap・角度ずれ・span・fallback・SVM は全部これに置き換わる。
-
-## 処理
-1. 種類判定 B/D（開口部が一様に明るい＝背面光あり＝B）
-2. 基準画像へ位置合わせ（SIFT+RANSAC ホモグラフィ → ECC 微調整）
-3. 基準座標で定義した `opening / plate / inner / outer` マスク（`geometry.py`）
-4. 割れらしさマップ
-   - D: 相対暗さ（多スケール black-hat ÷ 局所明るさ）× 細長さ（Hessian 固有値比）
-   - B: 局所ボディ輝度に対する明るさ（背面光の漏れ）
-5. 横断経路探索。見つけた経路の周囲を消して最大3本まで探す（複数割れ対応）
-6. D 候補は縁取りの途切れ（`rim_break`）を必須にする。B画像上の D 候補は B 開口の暗い縁を除外
-
-## 用語
-- **B** = 明るい割れ（割れ目から背面光が漏れて白く見える）
-- **D** = 暗い割れ（黒い割れ線）
-- **製品の種類（kind）** = type1（U字の脚が上まで長く見える）/ type2（U字の内側にネジ筒が見える）。
-  形（輪郭）だけで判定し、明るさは使わない。B/D とは別物。
-- 背面光の有無は1枚ごとに判定（`backlit=Y/N`）。背面光があれば B を検査、D は常に検査。
-
-## 判定の出し方
-- 最終判定は **OK / NG の1つだけ**。B/D を分けて扱う必要はない。
-- 証拠は2種類を同じ画像で両方見る（1枚に両方あってもよい）
-  - `dark_line` : 暗い割れ線（全画像で評価）
-  - `light_leak`: 割れから背面光が漏れている（背面光が写っている画角でだけ評価。正面照明の画角では光が漏れようがない）
-- `view`（B/D）は「どちらの画角か」＝どの基準画像に位置合わせするか、だけの意味。
-
-## 評価（validation / test）
-```
-python -m crack_v14.cli --input <validation画像フォルダ> --out out_val
-python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out_val --role VALIDATION
-```
-見逃し率・過検出率・位置一致（予測BBOXと正解BBOXの重なり）と、見逃し/過検出/位置ずれの画像名を出す。
-BBOX は入力画像の座標に戻して出力している（`results.csv`）。
-
-## 既知の見逃し
-- No.16（s08）: U字下からゲートを通って下端まで走る細い線（実物も割れ）。
-  MADE IN CHINA 側には同じ位置に成形線があるため、OK画像との差分なしでは区別できない。OK画像待ち。
-
-## 動作環境
-Python 3.12 / OpenCV 4.9.0 / numpy 1.26.4 / numba 0.60.0 で動作確認済み（画面写真20枚で判定は同じ結果）。
-scikit-image は不要（最短経路は `geodesic.py` に numba で実装。numba が無ければ純Pythonで動く）。
-
-## 実行
+## 使い方
 ```
 pip install -r requirements.txt
-python -m crack_v14.cli --input <画像フォルダ> --out out            # 実画像
-python -m crack_v14.cli --input data/raw_screen --out out --screen  # 画面撮影写真
-```
-出力: `out/<名前>.jpg`（経路と BBOX）、`out/result_grid.jpg`、`out/results.csv`
 
-## 実画像に載せ替えるとき（OK画像から基準を作る）
-```
-python -m crack_v14.make_ref --ok-dir pos1ok --out refs   # 種類は1枚ずつ自動で振り分け
-python -m crack_v14.cli --input <画像> --out out --ref-dir refs
-```
-OK画像を今の基準枠（geometry.py と同じ座標系）に位置合わせして中央値画像を作るので、geometry.py は描き直し不要。
-`refs/check_type1.jpg` `check_type2.jpg` で緑（内縁の外側）と赤（縦リブ・下端）が合っているか目で確認する。
-OKの中央値・ばらつき（ok_median / ok_mad）も同時に保存する（OK差分モデル用）。
+# 1. 基準を作る（最初の1回）。OK画像のフォルダは種類が混ざっていてよい
+#    仮の基準画像 data/refs/ref_type1.png, ref_type2.png が必要
+python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
+#    -> refs/check_type1.jpg, check_type2.jpg で線を確認
+#       緑 = U字内縁の縁取りのすぐ外側、赤 = 縦リブと下端、青 = 樹脂の部分 になっていれば OK
+#       ずれていたら --move-geom DX DY（右・下に何px）、--scale-geom（何倍）を付けて作り直す
 
-以下は手で描き直す場合:
-- `data/refs/ref_type1.png`, `ref_type2.png` を実画像の代表1枚ずつに差し替え、
-  `geometry.py` の座標をその画像上で描き直す（今は画面写真 960x660 の座標）。
-- 画角固定なので位置合わせは小さなずれ補正だけになり、今より安定するはず。
+# 2. 検査
+python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
 
-## 未解決（OK画像が来たらやること）
-- 誤検出率は未測定（OK画像ゼロのため）。閾値 `ratio_th / gap_th / d_lo / d_hi / rim_break_th` は暫定。
-- OK画像から画素ごとの median/MAD を作り、割れらしさを「OKからのずれ」に置き換える
-  → 縁・リブ・刻印・ゲート・成形線などの固定構造が消え、`edge_margin` 等の手当てが不要になる。
-- 刻印違い（MADE IN CHINA / eDV-…）は OK基準を分ける。
+# 3. 正解CSVとの比較
+python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out --role VALIDATION
+```
+
+## ファイル
+| ファイル | 中身 |
+|---|---|
+| cli.py | 検査の実行、結果の描画と CSV 出力 |
+| inspect_v14.py | 検査の流れと判定（閾値はここ） |
+| align.py | テンプレートマッチングでの位置合わせ |
+| features.py | 割れらしさマップ（B・D） |
+| crossing.py | 内縁 -> 外縁の経路探索、縁取りの途切れ |
+| geodesic.py | 最短経路探索（ダイクストラ法） |
+| geometry.py | 検査範囲の座標とマスク |
+| make_ref.py | OK画像から基準を作る（最初の1回） |
+| register.py | 特徴点照合（make_ref だけで使用） |
+| evaluate.py | 正解CSVとの比較 |
+| screen_crop.py | （テスト用）画面撮影写真の切り出し |
+
+## 未確認のこと
+- OK画像での過検出率（OK画像で回していないので不明）
+- 本物の template_table1.png・実画像での動作（テストは画面写真を加工したもので実施）
+- No.16 の中央の細い線は検出できていない（同じ位置に成形線があり、OK画像との比較が必要）

@@ -1,13 +1,13 @@
-"""Compare results with labels/defect_annotations.csv.
+"""検査結果を正解CSVと比べて、見逃し・過検出・位置の一致を数える。
 
-python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out [--role VALIDATION]
+  python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out [--role VALIDATION]
 
-labels columns: record_type,path,dataset_role,label_status,type,judgment,severity,x1,y1,x2,y2,note
-  - only label_status == CONFIRMED is used
-  - an image is NG if any of its rows has judgment == NG
-  - rows with x1..y2 filled are ground-truth defect boxes (input-image coordinates)
-pred: judgments.csv + results.csv written by crack_v14.cli
-A NG image counts as "located" if any predicted defect box overlaps a GT box (GT box padded by --pad px).
+正解CSVの列: record_type,path,dataset_role,label_status,type,judgment,severity,x1,y1,x2,y2,note
+  - label_status が CONFIRMED の行だけ使う
+  - その画像のどれかの行が judgment=NG なら、その画像は NG
+  - x1〜y2 が入っている行は、正解の割れの位置（入力画像の座標）
+予測: cli.py が出力した judgments.csv と results.csv
+位置の一致: 予測した割れの範囲が、正解の範囲（--pad px 広げたもの）と重なれば一致
 """
 import argparse, csv, os
 from collections import defaultdict

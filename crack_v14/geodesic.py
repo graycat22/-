@@ -1,7 +1,10 @@
-"""Minimum-cost path on an 8-connected grid (replacement for skimage MCP_Geometric).
+"""最短経路探索（ダイクストラ法）。画像の各画素を「通るのにかかる手間（コスト）」として、
+起点の集まりから各画素まで、一番手間の少ない道とその手間の合計を求める。
 
-edge cost (a->b) = 0.5 * (cost[a] + cost[b]) * step_length, inf = wall.
-Uses numba when available (fast), otherwise pure Python heapq (slow but works).
+  隣の画素への移動: 上下左右と斜めの8方向
+  移動の手間     : (今の画素のコスト + 隣の画素のコスト) / 2 × 移動距離（斜めは √2）
+  コストが inf   : 壁（通れない）
+numba があれば高速版、無ければ純Python版（遅いが同じ結果）で動く。
 """
 import heapq
 import numpy as np
@@ -48,7 +51,7 @@ if _HAS_NUMBA:
         h, w = cost.shape
         cum = np.full((h, w), np.inf)
         prev = np.full((h, w), -1, np.int64)
-        # binary heap of (dist, flat index)
+        # 「まだ調べていない画素」を手間の小さい順に取り出すための入れ物（二分ヒープ）
         cap = 1 << 16
         hd = np.empty(cap, np.float64); hi = np.empty(cap, np.int64); n = 0
         for i in range(sy.shape[0]):
@@ -102,7 +105,8 @@ if _HAS_NUMBA:
 
 
 class MCP:
-    """Same usage as skimage.graph.MCP_Geometric: find_costs(starts) -> (cum, None); traceback(end)."""
+    """使い方: mcp = MCP(コスト画像); cum, _ = mcp.find_costs(起点の一覧); 道 = mcp.traceback(終点)
+    cum[y, x] = 起点からその画素までの最小の手間。traceback は起点 -> 終点の (y, x) の並びを返す。"""
 
     def __init__(self, cost):
         self.cost = np.ascontiguousarray(cost, np.float64)
