@@ -23,11 +23,13 @@ PARAMS = dict(
     ratio_th=0.35,        # 道の上で健全部を通った割合がこれ以下なら「抜けている」（D: 暗い割れ）
     b_ratio_th=0.20,      # B（明るい割れ）は光が漏れてはっきり明るいので厳しくする（本物は 0.03〜0.06、リブの反射は 0.3 前後）
     gap_th=25.0,          # 割れていない区間が最長でもこれ以下 [px]
-    end_gap_inner=10.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
+    end_gap_inner=15.0,   # 割れが内側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     end_gap_outer=25.0,   # 割れが外側の端からこれ以上手前で止まっていたら半割れ（OK） [px]
     rim_break_th=0.30,    # D: 起点で縁取りがこれ以上切れていること（上げると過検出が減り、見逃しが増える）
     solid_ratio_th=0.12,  # D: 縁取りの途切れが弱くても、ここまできれいに端から端までつながった割れ線なら NG
     solid_gap_th=10.0,    #    （本物の割れ 0.05〜0.09 / 5px、OK品の傷・溝は 0.17 以上 / 29px 以上）
+    direct_ratio_th=0.0,  # D: まっすぐ外縁へ向かう割れ（遠回り度 direct_detour 以下）なら、ここまで緩める
+    direct_detour=2.0,    #    遠回り度 = 経路の長さ / 起点から外縁までの最短距離（溝や成形線を伝う道は大きくなる）
     reach_th=0.90,        # B: 漏れた光が開口部までつながっている割合
     d_lo=0.10, d_hi=0.30, # D: 相対的な暗さ（×細長さ）がこの範囲で割れらしさ 0 -> 1
     b_lo=2.5, b_hi=6.0,   # B: 周りより明るい度合いがこの範囲で割れらしさ 0 -> 1
@@ -74,6 +76,7 @@ class Inspector:
             return float(max((dist[P[:, 0], P[:, 1]] < hug_d).mean(), (dist_rib[P[:, 0], P[:, 1]] < 25).mean()))
 
         rim_mask = cr.m["rim"]
+        to_outer = cv2.distanceTransform((~cr.m["outer"]).astype(np.uint8), cv2.DIST_L2, 5)   # 外縁までの距離
 
         def reject(q):
             """割れではない道:
@@ -115,7 +118,12 @@ class Inspector:
                     q["rim_break"], ri = cr.rim_break(frame, start)
                     if cr.rim_ignored(ri):
                         q["rim_break"] = 0.0                            # ゲートの切り欠きは数えない
-                    solid = q["ratio"] <= p["solid_ratio_th"] and q["max_gap"] <= p["solid_gap_th"]
+                    P = q["path"]
+                    detour = q["length"] / max(float(to_outer[P[0, 0], P[0, 1]]), 1.0)
+                    q["detour"] = detour
+                    solid = q["max_gap"] <= p["solid_gap_th"] and (
+                        q["ratio"] <= p["solid_ratio_th"]
+                        or (q["ratio"] <= p["direct_ratio_th"] and detour <= p["direct_detour"]))
                     q["ng"] = q["ng"] and ends_ok and (q["rim_break"] >= p["rim_break_th"] or solid)
                 q.pop("prob", None)
 

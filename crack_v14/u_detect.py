@@ -188,7 +188,39 @@ def find_ribs(frame, left_leg, right_leg, y_from):
     return float(lx), float(rx)
 
 
-def detect_geometry(frame, edge_margin=10, min_thick=12):
+def find_plate_edges(frame, rim, y_from):
+    """プレートの左右の端（割れの終点）と、カセットの外側の縁（赤い枠）を探す。
+
+    U字の脚から外へ向かって明るさを見ると、どの型でも
+        プレート（明るめ） -> [段差で暗く] 溝 -> [段差で明るく] リブのハイライト -> [段差で暗く] リブの外側
+    の順に並んでいる。
+      プレートの端 = 脚とリブのハイライトの間で、一番はっきり外へ向かって暗くなる所
+                     （割れがここまで届けば「外縁まで割れた」とみなす。溝の中を這う線は数えない）
+      外側の縁     = リブのハイライトの外側の、外へ向かって暗くなる所（確認画像の赤い枠）
+    見つからないときは None を返す。
+    """
+    H, W = frame.shape
+    f = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=5) / 16
+    m = np.median(gx[int(min(H - 40, y_from)):H - 20], 0)          # 列ごとの、横方向の明るさの変化
+    out = {}
+    for side, leg in ((-1, rim[:, 0].min()), (1, rim[:, 0].max())):
+        xs = np.arange(int(leg) + 12 * side, int(leg) + 140 * side, side)
+        xs = xs[(xs > 2) & (xs < W - 3)]
+        if len(xs) < 20:
+            return None
+        v = side * m[xs]                         # 外へ向かって明るくなると +、暗くなると -
+        rise = int(np.argmax(v))                 # リブのハイライト
+        if v[rise] < 8 or rise < 5:
+            return None
+        edge = int(np.argmin(v[:rise - 2]))      # プレートの端（ハイライトより内側で一番暗くなる所）
+        after = v[rise:rise + 35]
+        drop = rise + int(np.argmin(after)) if len(after) and after.min() < -8 else min(rise + 10, len(xs) - 1)
+        out[side] = (float(xs[edge]), float(xs[drop]))
+    return out[-1][0], out[1][0], out[-1][1], out[1][1]
+
+
+def detect_geometry(frame, edge_margin=3, min_thick=40):
     """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
     W, H = SIZE
     op = find_opening(frame)                                    # U字の開口部を領域として切り出す
@@ -206,7 +238,13 @@ def detect_geometry(frame, edge_margin=10, min_thick=12):
     top_y = float(rim[:, 1].min())
     mid = rim[(rim[:, 1] > top_y + 0.2 * (bottom[1] - top_y)) & (rim[:, 1] < bottom[1] - 0.2 * (bottom[1] - top_y))]
     mid = mid if len(mid) else rim
-    lx, rx = find_ribs(frame, mid[:, 0].min(), mid[:, 0].max(), bottom[1] - 0.3 * (bottom[1] - top_y))
+    y_from = bottom[1] - 0.3 * (bottom[1] - top_y)
+    pe = find_plate_edges(frame, rim, y_from)
+    if pe is not None:
+        lx, rx, ox_l, ox_r = pe                                  # プレートの端（終点）と外側の縁（赤い枠）
+    else:
+        lx, rx = find_ribs(frame, mid[:, 0].min(), mid[:, 0].max(), y_from)
+        ox_l, ox_r = lx, rx
     half = (rim[:, 0].max() - rim[:, 0].min()) / 2
     gw = max(18.0, 0.12 * half)                               # ゲートの切り欠きの範囲（U字の大きさに比例）
     g = dict(
@@ -217,19 +255,23 @@ def detect_geometry(frame, edge_margin=10, min_thick=12):
         rim_ignore=[(float(bottom[0] - gw), float(bottom[1] - 15), float(bottom[0] + gw), float(bottom[1] + 60))],
         outer=[[(lx + 2, 0.0), (lx + 2, H - 1.0)], [(rx - 2, 0.0), (rx - 2, H - 1.0)], [(lx, H - 3.0), (rx, H - 3.0)]],
         center=(float(cx), float(cy)), score=float(total),
+        frame_box=(float(ox_l), float(ox_r)),
     )
     return g, float(total)
 
 
 def draw_geometry(frame, g):
-    """検査範囲を画像に重ねた確認用の画像（緑 = 縁取りの外側、赤 = 縦リブと下端、青 = 探す範囲）。"""
+    """検査範囲を画像に重ねた確認用の画像（緑 = 起点、青 = 探す範囲、オレンジ = 終点、赤 = カセットの外側の縁）。"""
     m = build_masks(g)
     vis = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     over = vis.copy()
     over[m["band"]] = (200, 80, 0)
     vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
     vis[m["inner"]] = (0, 220, 0)
-    vis[m["outer"]] = (0, 0, 255)
+    vis[m["outer"]] = (0, 165, 255)                  # オレンジ: 割れの終点（プレートの端）
+    if "frame_box" in g:                             # 赤: カセットの外側の縁
+        a_, b_ = g["frame_box"]
+        cv2.rectangle(vis, (int(a_), 1), (int(b_), vis.shape[0] - 2), (0, 0, 255), 2)
     for x0, y0, x1, y1 in g.get("rim_ignore", []):
         cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
     return vis
