@@ -330,7 +330,8 @@ FILES['crack_v14/draw_geom.py'] = r'''"""基準画像の上でクリックして
   左クリック = 点を打つ / 右クリック = 1つ戻す / Enter = 次の手順へ / Esc = やめる
 
 手順:
-  1. U字の縁取りの「外側の線」を、左の脚の上 -> 底 -> 右の脚の上 の順にたどってクリック（15〜25点くらい）
+  1. U字の縁取りの「外側の線」を、左の脚の上 -> 底 -> 右の脚の上 の順にたどってクリック（10〜20点くらい）
+     大まかでよい。終わったあと、近くの縁取りの境目に自動で吸い付ける（±18px の範囲）
   2. 左の縦リブの線を、上と下の2点クリック
   3. 右の縦リブの線を、上と下の2点クリック
   4. ゲートの切り欠き（6時の位置の、縁取りが最初から切れている所）を囲む四角の、左上と右下をクリック
@@ -381,6 +382,44 @@ def geom_from_clicks(rim, lrib, rrib, gate, top, edge_margin=10, min_thick=30):
                [(l_bot[0], H - 3), (r_bot[0], H - 3)]],             # 画像の下端
     )
     return g
+
+
+def snap_rim(ref, rim, search=18, step=4.0):
+    """クリックした縁取りの線を、近くの「本当の縁取りの外側の境目」に吸い付ける。
+
+    線の各点で、線に垂直な方向に ±search px の範囲を調べ、
+    「外側（樹脂、暗い）から内側（縁取り、明るい）へ一番強く明るくなる所」に点を動かす。
+    大まかになぞっただけでも、縁取りの境目にぴったり合うようにするため。
+    """
+    pts = np.array(rim, np.float64)
+    # 点を step px おきに並べ直す
+    seg = [np.linspace(a, b, max(2, int(np.hypot(*(b - a)) / step)), endpoint=False) for a, b in zip(pts[:-1], pts[1:])]
+    c = np.vstack(seg + [pts[-1:]])
+    t = np.gradient(c, axis=0)
+    t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+    n = np.stack([-t[:, 1], t[:, 0]], 1)
+    # 法線を開口部の内側に向ける（左の脚の上 -> 底 -> 右の脚の上 の順なら、内側は進行方向の左）
+    poly = np.array([(c[0][0], 0)] + c.tolist() + [(c[-1][0], 0)], np.float32).reshape(-1, 1, 2)
+    flip = np.array([cv2.pointPolygonTest(poly, (float(x + 6 * u), float(y + 6 * v)), False) < 0
+                     for (x, y), (u, v) in zip(c, n)])
+    n[flip] *= -1
+    img = cv2.GaussianBlur(ref.astype(np.float32), (0, 0), 1.5)
+
+    def val(q):
+        x = np.clip(q[:, 0], 0, ref.shape[1] - 1).astype(np.float32)
+        y = np.clip(q[:, 1], 0, ref.shape[0] - 1).astype(np.float32)
+        return cv2.remap(img, x.reshape(1, -1), y.reshape(1, -1), cv2.INTER_LINEAR).ravel()
+
+    ds = np.arange(-search, search + 1)
+    gain = np.stack([val(c + (d + 2) * n) - val(c + (d - 2) * n) for d in ds], 1)   # 内側へ向かう明るさの増え方
+    best = ds[np.argmax(gain, axis=1)].astype(np.float64)
+    best[gain.max(axis=1) < 8] = 0                      # はっきりした境目が無い所は動かさない
+    k = 11                                              # 飛び跳ねを抑える（前後11点の中央値）
+    pad = np.r_[[best[0]] * (k // 2), best, [best[-1]] * (k // 2)]
+    best = np.array([np.median(pad[i:i + k]) for i in range(len(best))])
+    out = c + best[:, None] * n
+    out[0], out[-1] = c[0], c[-1]                       # 両端（脚の上）はクリックした所のまま
+    return [(float(x), float(y)) for x, y in out]
 
 
 def draw_check(ref, g):
@@ -449,6 +488,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref-dir", default="refs")
     ap.add_argument("--kind", default=None, help="線を引く種類（省略すると全部）")
+    ap.add_argument("--no-snap", action="store_true", help="縁取りへの吸い付けをしない（クリックした所そのまま）")
     a = ap.parse_args()
     kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[4:-4] for p in glob.glob(os.path.join(a.ref_dir, "ref_*.png")))
     if not kinds:
@@ -458,7 +498,8 @@ def main():
         pts = collect_clicks(ref, kind)
         if pts is None:
             print("中止しました"); return
-        g = geom_from_clicks(pts["rim"], pts["lrib"], pts["rrib"], pts["gate"], pts["top"])
+        rim = pts["rim"] if a.no_snap else snap_rim(ref, pts["rim"])
+        g = geom_from_clicks(rim, pts["lrib"], pts["rrib"], pts["gate"], pts["top"])
         save_geom(a.ref_dir, kind, g)
         cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
         print(f"保存しました: {a.ref_dir}/geom_{kind}.json, check_{kind}.jpg")
