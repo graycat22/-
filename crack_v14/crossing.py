@@ -21,10 +21,10 @@ ON = 0.15   # 割れらしさがこれより大きい画素を「割れの上」
 
 class Crossing:
     def __init__(self, geom, eps=0.03):
-        """geom: 検査範囲の定義（geometry.load_geom の戻り値）。"""
+        """geom: 検査範囲の定義（u_detect.detect_geometry が作ったもの）。"""
         self.g, self.eps = geom, eps
         self.m = build_masks(geom)
-        # 縁取りの太さ（draw_geom が測ったもの）の分だけ内側まで調べる（それより内側は開口部の背景なので見ない）。
+        # 縁取りの太さ（u_detect が測ったもの）の分だけ内側まで調べる（それより内側は開口部の背景なので見ない）。
         # 割れが縁取りを内側の端まで切っているか（= U字の内側まで割れているか）を確かめるため
         rw = geom.get("rim_width")
         self._build_rim(geom["opening"], depth=16 if rw is None else max(8, int(round(rw))))
@@ -75,20 +75,19 @@ class Crossing:
         self.rim_pts, self.rim_nrm, self.rim_depth = c, nrm, depth
 
     def rim_profile(self, gray):
-        """輪郭の各点で、縁取りを横切る方向に明るさを測り、縁取りの明るさ（縁取りの太さの範囲の中央値）を返す。
-        中央値にしているのは、縁取りが二重線で外側の線だけが切れている割れも、明るさの低下として拾うため。"""
+        """輪郭の各点で、縁取りを横切る方向に明るさを測り、縁取りの明るさ（縁取りの太さの範囲で上位15%の値）を返す。"""
         d = np.arange(-2, self.rim_depth + 1)
         xy = self.rim_pts[:, None, :] + d[None, :, None] * self.rim_nrm[:, None, :]
         x = xy[..., 0].clip(0, gray.shape[1] - 1).astype(np.float32)
         y = xy[..., 1].clip(0, gray.shape[0] - 1).astype(np.float32)
         v = cv2.remap(cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32), x, y, cv2.INTER_LINEAR)
-        return np.percentile(v, 50, axis=1)
+        return np.percentile(v, 85, axis=1)
 
     def nearest_rim(self, xy):
         """点 xy に一番近い輪郭点の番号。"""
         return int(np.argmin(np.hypot(*(self.rim_pts - xy).T)))
 
-    def rim_break(self, gray, start_xy, win=10, ctx=60):
+    def rim_break(self, gray, start_xy, win=20, ctx=100):
         """縁取りの途切れ度（0 = 途切れていない、1 = 完全に切れている）。
 
         割れの起点付近（±win 点）の縁取りの明るさを、その前後（ctx 点の範囲）の明るさと比べる。

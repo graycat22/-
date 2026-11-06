@@ -1,11 +1,11 @@
-img,judgment,evidence,n_defects
+img,judgment,type,n_defects
 s00_125e8c09,NG,B,1
 s01_6cb23f18,NG,B,1
-s02_b6d124f8,NG,D,1
+s02_b6d124f8,OK,,0
 s03_5c60b09a,NG,D,1
 s04_9723eae9,NG,D,1
 s05_37224a1e,NG,D,1
-s06_879f9d4d,NG,D,1
+s06_879f9d4d,OK,,0
 s07_b94fc013,NG,D,1
 s08_24421e44,OK,,0
 s09_ad9b54c1,NG,B,1
@@ -15,7 +15,7 @@ s12_f34f3a93,NG,B,1
 s13_7ee8cc1e,NG,B,1
 s14_d8e3f916,NG,B,1
 s15_9ad6f7d3,NG,B,1
-s16_3efdc663,NG,D,1
+s16_3efdc663,OK,,0
 s17_2ae0b2e0,NG,B,1
 s18_bafdb4f7,NG,B,1
 s19_bf4b45c1,NG,D,1

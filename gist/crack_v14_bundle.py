@@ -1,74 +1,26 @@
 """crack_v14 一式（1ファイル版）。 python crack_v14_bundle.py で crack_v14/ フォルダを展開する。
 
-展開したあと:
+展開したあと（基準画像・テンプレート・線引きは不要）:
   pip install -r requirements.txt
-  python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
-  python -m crack_v14.draw_geom --ref-dir refs
-  python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
+  python -m crack_v14.cli --input <画像フォルダ> --out out
+  python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out
 詳しくは crack_v14/README.md
 """
 import os
 FILES = {}
 FILES['crack_v14/__init__.py'] = r''''''
-FILES['crack_v14/align.py'] = r'''"""位置合わせ（テンプレートマッチング）。
-
-今の検査システムと同じ考え方:
-  検査画像の中から template_table1.png（右側のネジ2つと黒い留め具）に似た所を
-  cv2.matchTemplate で探し、基準画像のときの位置との差を X・Y の補正量にする。
-
-カメラは固定なので、ずれは平行移動だけと考える（回転・拡大縮小は補正しない）。
-補正したあと、検査の座標（基準座標 960x660）に縮小する。
-"""
-import cv2
-import numpy as np
-
-from .geometry import SIZE
-
-
-class TemplateAligner:
-    def __init__(self, template_gray, blur=1.5):
-        """template_gray: template_table1.png をグレースケールで読んだもの。"""
-        if template_gray is None:
-            raise ValueError("テンプレート画像が読めません")
-        self.blur = blur
-        self.tpl = self._prep(template_gray)
-
-    def _prep(self, g):
-        # 細かいノイズや反射の差で一致度がぶれないよう、少しぼかしてから比べる
-        return cv2.GaussianBlur(g, (0, 0), self.blur) if self.blur > 0 else g
-
-    def locate(self, gray):
-        """テンプレートが一番よく一致した位置（左上の x, y）と一致度（-1〜1、1が完全一致）を返す。"""
-        res = cv2.matchTemplate(self._prep(gray), self.tpl, cv2.TM_CCOEFF_NORMED)
-        _, score, _, (x, y) = cv2.minMaxLoc(res)   # 最大値とその位置
-        return float(x), float(y), float(score)
-
-
-def frame_matrix(image_shape, offset):
-    """入力画像 -> 基準座標 への変換行列（3x3）。
-
-    1. offset (dx, dy) だけ平行移動して、基準画像と同じ位置にそろえる
-    2. 960x660 に縮小する
-    """
-    h, w = image_shape[:2]
-    sx, sy = SIZE[0] / w, SIZE[1] / h
-    dx, dy = offset
-    return np.array([[sx, 0, sx * dx], [0, sy, sy * dy], [0, 0, 1]], np.float64)
-
-
-def to_frame(gray, M):
-    """変換行列 M で入力画像を基準座標の画像（960x660）にする。"""
-    return cv2.warpAffine(gray, M[:2], SIZE, flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REPLICATE)
-'''
 FILES['crack_v14/cli.py'] = r'''"""検査の実行。
 
-  python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
+  python -m crack_v14.cli --input <画像フォルダ> --out out
+
+基準画像・テンプレート・設定ファイルは不要（U字は1枚ごとに自動で見つける）。
 
 出力（out/）:
   <画像名>.jpg     入力画像に、見つけた割れの経路を描いたもの（水色 = B 明るい割れ、赤 = D 暗い割れ）
+                   細い緑の線 = 見つけた U字の縁取り、細い黄色の線 = 見つけた縦リブ（確認用）
   result_grid.jpg  全画像の一覧
   judgments.csv    画像ごとの判定（img, judgment, type, n_defects）
-  results.csv      割れ候補ごとの数値（img, kind, type, rank, ratio, max_gap, inner_gap, outer_gap,
+  results.csv      割れ候補ごとの数値（img, type, rank, ratio, max_gap, inner_gap, outer_gap,
                    rim_break, reach, ng, x1, y1, x2, y2）  座標は入力画像の座標
 """
 import argparse
@@ -88,16 +40,13 @@ COLORS = {"B": (255, 200, 0), "D": (0, 0, 255)}   # BGR: B は水色、D は赤
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="検査する画像のフォルダ")
-    ap.add_argument("--template", required=True, help="template_table1.png")
-    ap.add_argument("--ref-dir", default="refs", help="make_ref で作った基準フォルダ")
     ap.add_argument("--out", default="out")
+    ap.add_argument("--template", default=None, help="（互換のため受け付けるが、使わない）")
+    ap.add_argument("--ref-dir", default=None, help="（互換のため受け付けるが、使わない）")
     ap.add_argument("--screen", action="store_true", help="（テスト用）入力が画面をスマホで撮った写真のとき")
     a = ap.parse_args()
 
-    template = cv2.imread(a.template, 0)
-    if template is None:
-        raise SystemExit(f"テンプレート画像が読めません: {a.template}")
-    ins = Inspector(a.ref_dir, template)
+    ins = Inspector()
     os.makedirs(a.out, exist_ok=True)
     files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.input, f"*.{e}")))
 
@@ -114,10 +63,14 @@ def main():
             continue
 
         # 1行の表示: 種類、背面光の有無、テンプレート一致度、判定、候補ごとの数値
-        msg = (f"{name:24s} kind={r['kind']} backlit={'Y' if r['backlit'] else 'N'} "
-               f"tpl={r['template_score']:.2f} {r['judgment']:2s} {r['detail']:4s}")
+        msg = (f"{name:24s} backlit={'Y' if r['backlit'] else 'N'} "
+               f"u={r['u_score']:.0f} {r['judgment']:2s} {r['detail']:4s}")
         vis = img.copy()
         lw = max(2, round(vis.shape[1] / 320))           # 画像の大きさに合わせた線の太さ
+        # 見つけた U字と縦リブ（細い線、確認用）
+        cv2.polylines(vis, [r["u_img"]["rim"].astype(np.int32)], False, (0, 200, 0), max(1, lw // 2))
+        for line in r["u_img"]["ribs"]:
+            cv2.polylines(vis, [line.astype(np.int32)], False, (0, 220, 255), max(1, lw // 2))
         for t in ("D", "B"):
             for i, q in enumerate(r["res"].get(t, [])):
                 if q["ng"]:
@@ -129,7 +82,7 @@ def main():
                         + (f" reach={rc:.2f}" if rc is not None else "")
                         + (" NG" if q["ng"] else ""))
                 (x1, y1), (x2, y2) = q["path_img"].min(0).astype(int), q["path_img"].max(0).astype(int)
-                rows.append([name, r["kind"], t, i, round(q["ratio"], 3), round(q["max_gap"], 1),
+                rows.append([name, t, i, round(q["ratio"], 3), round(q["max_gap"], 1),
                              round(q["inner_gap"], 1), round(q["outer_gap"], 1),
                              "" if rb is None else round(rb, 3), "" if rc is None else round(rc, 3),
                              q["ng"], x1, y1, x2, y2])
@@ -150,7 +103,7 @@ def main():
                     np.vstack([np.hstack(tiles[i:i + 4]) for i in range(0, len(tiles), 4)]))
     with open(os.path.join(a.out, "results.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["img", "kind", "type", "rank", "ratio", "max_gap", "inner_gap", "outer_gap",
+        w.writerow(["img", "type", "rank", "ratio", "max_gap", "inner_gap", "outer_gap",
                     "rim_break", "reach", "ng", "x1", "y1", "x2", "y2"])
         w.writerows(rows)
     with open(os.path.join(a.out, "judgments.csv"), "w", newline="") as fh:
@@ -185,10 +138,10 @@ ON = 0.15   # 割れらしさがこれより大きい画素を「割れの上」
 
 class Crossing:
     def __init__(self, geom, eps=0.03):
-        """geom: 検査範囲の定義（geometry.load_geom の戻り値）。"""
+        """geom: 検査範囲の定義（u_detect.detect_geometry が作ったもの）。"""
         self.g, self.eps = geom, eps
         self.m = build_masks(geom)
-        # 縁取りの太さ（draw_geom が測ったもの）の分だけ内側まで調べる（それより内側は開口部の背景なので見ない）。
+        # 縁取りの太さ（u_detect が測ったもの）の分だけ内側まで調べる（それより内側は開口部の背景なので見ない）。
         # 割れが縁取りを内側の端まで切っているか（= U字の内側まで割れているか）を確かめるため
         rw = geom.get("rim_width")
         self._build_rim(geom["opening"], depth=16 if rw is None else max(8, int(round(rw))))
@@ -239,20 +192,19 @@ class Crossing:
         self.rim_pts, self.rim_nrm, self.rim_depth = c, nrm, depth
 
     def rim_profile(self, gray):
-        """輪郭の各点で、縁取りを横切る方向に明るさを測り、縁取りの明るさ（縁取りの太さの範囲の中央値）を返す。
-        中央値にしているのは、縁取りが二重線で外側の線だけが切れている割れも、明るさの低下として拾うため。"""
+        """輪郭の各点で、縁取りを横切る方向に明るさを測り、縁取りの明るさ（縁取りの太さの範囲で上位15%の値）を返す。"""
         d = np.arange(-2, self.rim_depth + 1)
         xy = self.rim_pts[:, None, :] + d[None, :, None] * self.rim_nrm[:, None, :]
         x = xy[..., 0].clip(0, gray.shape[1] - 1).astype(np.float32)
         y = xy[..., 1].clip(0, gray.shape[0] - 1).astype(np.float32)
         v = cv2.remap(cv2.GaussianBlur(gray, (0, 0), 1.0).astype(np.float32), x, y, cv2.INTER_LINEAR)
-        return np.percentile(v, 50, axis=1)
+        return np.percentile(v, 85, axis=1)
 
     def nearest_rim(self, xy):
         """点 xy に一番近い輪郭点の番号。"""
         return int(np.argmin(np.hypot(*(self.rim_pts - xy).T)))
 
-    def rim_break(self, gray, start_xy, win=10, ctx=60):
+    def rim_break(self, gray, start_xy, win=20, ctx=100):
         """縁取りの途切れ度（0 = 途切れていない、1 = 完全に切れている）。
 
         割れの起点付近（±win 点）の縁取りの明るさを、その前後（ctx 点の範囲）の明るさと比べる。
@@ -323,245 +275,6 @@ class Crossing:
             cv2.polylines(m, [r["path"][:, ::-1].astype(np.int32)], False, 1, 2 * sep + 1)
             p[m.astype(bool)] = 0.0
         return out
-'''
-FILES['crack_v14/draw_geom.py'] = r'''"""基準画像の上でクリックして、検査範囲の線を引くツール。種類ごとに1回だけやる。
-
-使い方:
-  python -m crack_v14.draw_geom --ref-dir refs              # 全部の種類を順番に
-  python -m crack_v14.draw_geom --ref-dir refs --kind type1  # 1つだけ
-
-画面の操作（どの手順でも共通）:
-  左クリック = 点を打つ / 右クリック = 1つ戻す / Enter = 次の手順へ / Esc = やめる
-
-手順:
-  1. U字の縁取りの「外側の線」を、左の脚の上 -> 底 -> 右の脚の上 の順にたどってクリック（10〜20点くらい）
-     大まかでよい。終わったあと、近くの縁取りの境目に自動で吸い付ける（±18px の範囲）
-  2. 左の縦リブの線を、上と下の2点クリック
-  3. 右の縦リブの線を、上と下の2点クリック
-  4. ゲートの切り欠き（6時の位置の、縁取りが最初から切れている所）を囲む四角の、左上と右下をクリック
-     （無ければそのまま Enter）
-  5. 検査を始める高さを1点クリック（これより上の脚の部分は検査しない）
-
-終わると geom_<種類>.json と check_<種類>.jpg（線を重ねた確認画像）が保存される。
-"""
-import argparse
-import glob
-import os
-
-import cv2
-import numpy as np
-
-from .geometry import SIZE, build_masks, save_geom
-
-STEPS = [
-    ("rim", None, "1. U字の縁取りの外側を、左の脚の上 -> 底 -> 右の脚の上 の順にクリック", "1: rim outer edge, left top -> bottom -> right top"),
-    ("lrib", 2, "2. 左の縦リブの線を、上と下の2点クリック", "2: left rib line (top, bottom)"),
-    ("rrib", 2, "3. 右の縦リブの線を、上と下の2点クリック", "3: right rib line (top, bottom)"),
-    ("gate", 2, "4. ゲートの切り欠きを囲む四角の左上と右下をクリック（無ければ Enter）", "4: gate notch box (2 clicks or Enter)"),
-    ("top", 1, "5. 検査を始める高さを1点クリック", "5: inspection top (1 click)"),
-]
-
-
-def geom_from_clicks(rim, lrib, rrib, gate, top, edge_margin=10, min_thick=30):
-    """クリックした点から検査範囲の定義を作る。"""
-    W, H = SIZE
-
-    def line_x_at(p, q, y):          # 2点を通る直線の、高さ y での x
-        (x1, y1), (x2, y2) = p, q
-        return x1 if y2 == y1 else x1 + (x2 - x1) * (y - y1) / (y2 - y1)
-
-    # 縦リブは画像の上から下まで伸ばす
-    l_top, l_bot = (line_x_at(*lrib, 0), 0), (line_x_at(*lrib, H - 1), H - 1)
-    r_top, r_bot = (line_x_at(*rrib, 0), 0), (line_x_at(*rrib, H - 1), H - 1)
-    # 開口部の多角形: クリックした縁取りの線を、両端とも画像の上端まで伸ばして閉じる
-    opening = [(rim[0][0], 0)] + [tuple(p) for p in rim] + [(rim[-1][0], 0)]
-    g = dict(
-        y_eval=int(top[0][1]), edge_margin=edge_margin, min_thick=min_thick,
-        opening=[(float(x), float(y)) for x, y in opening],
-        plate=[l_top, r_top, r_bot, l_bot],
-        rim_ignore=[(min(gate[0][0], gate[1][0]), min(gate[0][1], gate[1][1]),
-                     max(gate[0][0], gate[1][0]), max(gate[0][1], gate[1][1]))] if len(gate) == 2 else [],
-        outer=[[(l_top[0] + 2, 0), (l_bot[0] + 2, H - 1)],          # 左リブの少し内側
-               [(r_top[0] - 2, 0), (r_bot[0] - 2, H - 1)],          # 右リブの少し内側
-               [(l_bot[0], H - 3), (r_bot[0], H - 3)]],             # 画像の下端
-    )
-    return g
-
-
-def _smooth(a, k):
-    """点の並びを前後 k 点の平均でなめらかにする（両端はそのまま伸ばす）。"""
-    if k <= 1 or len(a) < k:
-        return a
-    pad = np.concatenate([np.repeat(a[:1], k // 2, 0), a, np.repeat(a[-1:], k // 2, 0)])
-    ker = np.ones(k) / k
-    return np.stack([np.convolve(pad[:, i], ker, mode="valid") for i in range(a.shape[1])], 1)
-
-
-def snap_rim(ref, rim, search=18, step=4.0, smooth_penalty=2.0):
-    """クリックした縁取りの線を、近くの「本当の縁取りの外側の境目」に吸い付ける。
-
-    線の各点で、線に垂直な方向に ±search px の範囲を調べ、
-    「外側（樹脂、暗い）から内側（縁取り、明るい）へ明るくなる強さ」を測る。
-    ただし点ごとにバラバラに一番強い所へ動かすとガタガタになるので、
-    「隣の点とのずれは 1px まで、ずれるほど減点」という条件で、線全体として一番よく合う道を
-    動的計画法でまとめて選ぶ（なめらかな線になる）。
-
-    戻り値: (吸い付けた点の並び, 縁取りの太さ[px])
-    """
-    pts = np.array(rim, np.float64)
-    seg = [np.linspace(a, b, max(2, int(np.hypot(*(b - a)) / step)), endpoint=False) for a, b in zip(pts[:-1], pts[1:])]
-    c = _smooth(np.vstack(seg + [pts[-1:]]), 9)          # クリックの角をならしてから法線を求める
-    t = np.gradient(c, axis=0)
-    t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
-    n = np.stack([-t[:, 1], t[:, 0]], 1)
-    poly = np.array([(c[0][0], 0)] + c.tolist() + [(c[-1][0], 0)], np.float32).reshape(-1, 1, 2)
-    flip = np.array([cv2.pointPolygonTest(poly, (float(x + 6 * u), float(y + 6 * v)), False) < 0
-                     for (x, y), (u, v) in zip(c, n)])
-    n[flip] *= -1                                         # 法線を開口部の内側へ向ける
-    img = cv2.GaussianBlur(ref.astype(np.float32), (0, 0), 1.5)
-
-    def val(q):
-        x = np.clip(q[:, 0], 0, ref.shape[1] - 1).astype(np.float32)
-        y = np.clip(q[:, 1], 0, ref.shape[0] - 1).astype(np.float32)
-        return cv2.remap(img, x.reshape(1, -1), y.reshape(1, -1), cv2.INTER_LINEAR).ravel()
-
-    ds = np.arange(-search, search + 1)
-    gain = np.stack([val(c + (d + 2) * n) - val(c + (d - 2) * n) for d in ds], 1)   # 内側へ向かって明るくなる強さ
-    gain = np.clip(gain, -40, 80)
-
-    # ---- 動的計画法: 各点のずらし量 d を、隣とのずれ 1px 以内でなめらかに選ぶ
-    N, D = gain.shape
-    acc = gain[0].copy()
-    back = np.zeros((N, D), np.int64)
-    for i in range(1, N):
-        cand = np.full((3, D), -1e9)
-        for k, sh in enumerate((-1, 0, 1)):               # 前の点のずらし量が d-1, d, d+1 のどれか
-            prev = np.roll(acc, sh)
-            if sh == -1: prev[-1] = -1e9
-            if sh == 1: prev[0] = -1e9
-            cand[k] = prev - smooth_penalty * abs(sh)
-        arg = np.argmax(cand, 0)                          # 一番良かった前の点の選び方
-        # np.roll(acc, sh)[d] は acc[d - sh] なので、前の点のずらし量の番号は d - sh
-        back[i] = np.arange(D) - np.array((-1, 0, 1))[arg]
-        acc = cand[arg, np.arange(D)] + gain[i]
-    d_idx = np.zeros(N, np.int64)
-    d_idx[-1] = int(np.argmax(acc))
-    for i in range(N - 1, 0, -1):
-        d_idx[i - 1] = np.clip(back[i, d_idx[i]], 0, D - 1)
-    out = _smooth(c + ds[d_idx][:, None] * n, 5)
-
-    # ---- 縁取りの太さ: 外側の境目から内側へ進み、明るい縁取りが終わって暗くなる所までの距離
-    ws = np.arange(4, 46)
-    fall = np.stack([val(out + (w + 2) * n) - val(out + (w - 2) * n) for w in ws], 1)   # 内側へ向かって暗くなる所が負
-    strong = fall.min(1) < -15
-    width = float(np.median(ws[np.argmin(fall, 1)][strong])) if strong.any() else 16.0
-    return [(float(x), float(y)) for x, y in out], width
-
-
-def draw_check(ref, g):
-    """検査範囲を基準画像に重ねた確認画像（緑 = 起点、赤 = 終点、青 = 探す範囲）。"""
-    m = build_masks(g)
-    vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
-    over = vis.copy()
-    over[m["band"]] = (200, 80, 0)
-    vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
-    vis[m["inner"]] = (0, 220, 0)
-    vis[m["outer"]] = (0, 0, 255)
-    y = g["y_eval"]
-    cv2.line(vis, (0, y), (SIZE[0] - 1, y), (0, 200, 255), 1)      # 検査を始める高さ
-    for x0, y0, x1, y1 in g.get("rim_ignore", []):
-        cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
-    return vis
-
-
-def collect_clicks(ref, kind):
-    """画面に基準画像を出して、手順ごとにクリックを集める。"""
-    pts = {k: [] for k, *_ in STEPS}
-    state = {"i": 0}
-    win = f"draw_geom {kind}"
-
-    def on_mouse(ev, x, y, *_):
-        key, n, *_ = STEPS[state["i"]]
-        if ev == cv2.EVENT_LBUTTONDOWN and (n is None or len(pts[key]) < n):
-            pts[key].append((x, y))
-        elif ev == cv2.EVENT_RBUTTONDOWN and pts[key]:
-            pts[key].pop()
-
-    cv2.namedWindow(win)
-    cv2.setMouseCallback(win, on_mouse)
-    print(f"\n=== {kind} ===")
-    print("左クリック = 点を打つ / 右クリック = 1つ戻す / Enter = 次へ / Esc = やめる")
-    print(STEPS[0][2])
-    while True:
-        key, n, jp, en = STEPS[state["i"]]
-        vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
-        colors = {"rim": (0, 220, 0), "lrib": (0, 0, 255), "rrib": (0, 0, 255), "gate": (0, 200, 255), "top": (255, 200, 0)}
-        for k, ps in pts.items():
-            for p in ps:
-                cv2.circle(vis, p, 3, colors[k], -1)
-            if len(ps) >= 2 and k != "gate":
-                cv2.polylines(vis, [np.array(ps, np.int32)], False, colors[k], 1)
-        cv2.rectangle(vis, (0, 0), (SIZE[0], 24), (0, 0, 0), -1)
-        cv2.putText(vis, en, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-        cv2.imshow(win, vis)
-        k = cv2.waitKey(30) & 0xFF
-        if k == 27:                                   # Esc
-            cv2.destroyWindow(win)
-            return None
-        if k in (13, 10):                             # Enter
-            ok = (len(pts[key]) >= 5) if n is None else (len(pts[key]) == n or key == "gate")
-            if not ok:
-                print("  点が足りません")
-                continue
-            state["i"] += 1
-            if state["i"] == len(STEPS):
-                cv2.destroyWindow(win)
-                return pts
-            print(STEPS[state["i"]][2])
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ref-dir", default="refs")
-    ap.add_argument("--kind", default=None, help="線を引く種類（省略すると全部）")
-    ap.add_argument("--no-snap", action="store_true", help="縁取りへの吸い付けをしない（クリックした所そのまま）")
-    ap.add_argument("--resnap", action="store_true",
-                    help="クリックし直さず、今ある線（geom_*.json）を縁取りの境目に吸い付け直すだけ")
-    a = ap.parse_args()
-    if a.resnap:
-        from .geometry import load_geom
-        kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[5:-5] for p in glob.glob(os.path.join(a.ref_dir, "geom_*.json")))
-        for kind in kinds:
-            ref = cv2.imread(os.path.join(a.ref_dir, f"ref_{kind}.png"), 0)
-            g = load_geom(a.ref_dir, kind)
-            if ref is None or g is None:
-                print(f"[{kind}] 基準画像か線が無いので飛ばします"); continue
-            rim = g["opening"][1:-1]                     # 上端で閉じるための点を除いた、クリックした縁取りの線
-            new, width = snap_rim(ref, rim)
-            g["opening"] = [(new[0][0], 0.0)] + new + [(new[-1][0], 0.0)]
-            g["rim_width"] = width
-            save_geom(a.ref_dir, kind, g)
-            cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
-            print(f"[{kind}] 線を吸い付け直しました（縁取りの太さ {width:.0f}px）-> {a.ref_dir}/check_{kind}.jpg")
-        return
-    kinds = [a.kind] if a.kind else sorted(os.path.basename(p)[4:-4] for p in glob.glob(os.path.join(a.ref_dir, "ref_*.png")))
-    if not kinds:
-        raise SystemExit(f"基準画像がありません: {a.ref_dir}（先に make_ref を実行してください）")
-    for kind in kinds:
-        ref = cv2.imread(os.path.join(a.ref_dir, f"ref_{kind}.png"), 0)
-        pts = collect_clicks(ref, kind)
-        if pts is None:
-            print("中止しました"); return
-        rim, width = (pts["rim"], 16.0) if a.no_snap else snap_rim(ref, pts["rim"])
-        g = geom_from_clicks(rim, pts["lrib"], pts["rrib"], pts["gate"], pts["top"])
-        g["rim_width"] = width
-        save_geom(a.ref_dir, kind, g)
-        cv2.imwrite(os.path.join(a.ref_dir, f"check_{kind}.jpg"), draw_check(ref, g))
-        print(f"保存しました: {a.ref_dir}/geom_{kind}.json, check_{kind}.jpg")
-
-
-if __name__ == "__main__":
-    main()
 '''
 FILES['crack_v14/evaluate.py'] = r'''"""検査結果を正解CSVと比べて、見逃し・過検出・位置の一致を数える。
 
@@ -836,8 +549,7 @@ class MCP:
 '''
 FILES['crack_v14/geometry.py'] = r'''"""検査範囲（U字の内縁・外縁・プレート）の定義。
 
-座標はすべて「基準座標」で書く。基準座標とは、入力画像を位置補正してから
-960x660 に縮小した画像の座標のこと（SIZE）。
+座標はすべて「検査の座標」で書く。入力画像を 960x660 に縮小した画像の座標のこと（SIZE）。
 
   opening    : U字の開口部（中の背景が見える穴）。縁取りの外側の線までを含む多角形
   plate      : 割れが横切る樹脂のプレート部分（この中から opening を除いた所が検査範囲）
@@ -847,57 +559,12 @@ FILES['crack_v14/geometry.py'] = r'''"""検査範囲（U字の内縁・外縁・
   edge_margin: プレートの端から何px以内を「割れの証拠にしない」か（リブの縁の黒い線を拾わないため）
   min_thick  : 健全な肉厚がこれより薄い所は検査しない
 
-検査範囲は draw_geom.py で基準画像の上をクリックして作り、refs/geom_<種類>.json に保存する。
-下の DEFAULT_GEOM は、画面写真（テスト用）の上で描いた座標の例。
+検査範囲は u_detect.py が1枚ごとに画像から自動で作る。
 """
-import json
-import os
-
 import cv2
 import numpy as np
 
-SIZE = (960, 660)  # 基準座標の大きさ (幅, 高さ)
-
-DEFAULT_GEOM = {
-    # 製品の種類1: U字の脚が上まで長く見える
-    "type1": dict(
-        y_eval=380, edge_margin=14,
-        opening=[(262, 60), (265, 350), (285, 420), (330, 470), (400, 497), (450, 502), (520, 497),
-                 (590, 470), (630, 420), (652, 350), (652, 60)],
-        plate=[(236, 60), (688, 60), (688, 660), (236, 660)],
-        rim_ignore=[(440, 470, 510, 530)],
-        outer=[[(686, 60), (686, 660)], [(238, 60), (238, 660)], [(236, 657), (688, 657)]],
-    ),
-    # 製品の種類2: U字の内側にネジ筒が見える（MADE IN CHINA / eDV 刻印）
-    "type2": dict(
-        y_eval=120, edge_margin=10, min_thick=30,
-        opening=[(195, 0), (200, 250), (215, 300), (250, 360), (300, 402), (380, 428), (450, 434),
-                 (530, 422), (592, 390), (640, 350), (690, 290), (720, 230), (736, 0)],
-        plate=[(152, 0), (758, 0), (758, 660), (152, 660)],
-        rim_ignore=[(430, 400, 520, 460)],          # 6時の位置のゲート切り欠き
-        outer=[[(756, 0), (756, 660)], [(154, 0), (154, 660)], [(152, 657), (758, 657)]],
-    ),
-}
-
-
-# ------------------------------------------------------------------ 読み書き
-def geom_path(ref_dir, kind):
-    return os.path.join(ref_dir, f"geom_{kind}.json")
-
-
-def load_geom(ref_dir, kind):
-    """refs/geom_<種類>.json を読む。無ければ None。"""
-    p = geom_path(ref_dir, kind)
-    if not os.path.exists(p):
-        return None
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_geom(ref_dir, kind, g):
-    with open(geom_path(ref_dir, kind), "w", encoding="utf-8") as f:
-        json.dump(g, f, ensure_ascii=False, indent=1)
-
+SIZE = (960, 660)  # 検査の座標の大きさ (幅, 高さ)
 
 # ------------------------------------------------------------------ マスク作成
 def _poly(pts, shape, closed=True, thick=None):
@@ -936,30 +603,23 @@ def build_masks(g, rim_band=10):
 '''
 FILES['crack_v14/inspect_v14.py'] = r'''"""カセットワレ検査 V14 の本体。1枚の画像を受け取って OK / NG を返す。
 
+製品の種類（U字の太さ・形・刻印）が違っても、基準画像や設定なしで動く。
+
 流れ:
-  1. 位置合わせ   : template_table1.png をテンプレートマッチングで探し、X・Y のずれを補正して 960x660 に縮小
-  2. 種類の判定   : 種類1・種類2の基準画像と輪郭を比べて、よく合う方にする（明るさは使わない）
-  3. 背面光の判定 : U字の開口部が明るいか（背面光がある画像だけ B を検査する）
-  4. 割れらしさ   : D（暗い割れ線）は全画像、B（明るい割れ）は背面光ありの画像で計算
-  5. 経路探索     : 内縁から外縁まで、割れっぽい所だけを通って抜けられるか（crossing.py）
-  6. 判定         : 割れの定義「U字の内側から外縁まで、端から端まで割れている」を満たせば NG
-
-基準フォルダ（refs/）の中身:
-  ref_<種類>.png      基準画像（OK画像の中央値、基準座標 960x660）     make_ref.py が作る
-  info_<種類>.json    基準画像を作ったときのテンプレート位置と画像サイズ   make_ref.py が作る
-  geom_<種類>.json    検査範囲の座標                                       draw_geom.py で線を引いて作る
+  1. 縮小      : 入力画像を 960x660 にする（この座標で検査する）
+  2. U字を探す : その画像の中から、U字の縁取り・縦リブ・ゲートの切り欠きを自動で見つける（u_detect.py）
+  3. 背面光    : U字の開口部の中が明るいか（明るければ B も検査する）
+  4. 割れらしさ: D（暗い割れ線）は全画像、B（明るい割れ）は背面光ありの画像で計算（features.py）
+  5. 経路探索  : 内縁から外縁まで、割れっぽい所だけを通って抜けられるか（crossing.py）
+  6. 判定      : 割れの定義「U字の内側から外縁まで、端から端まで割れている」を満たせば NG
 """
-import glob
-import json
-import os
-
 import cv2
 import numpy as np
 
-from .align import TemplateAligner, frame_matrix, to_frame
 from .crossing import Crossing
 from .features import bright_gap_map, dark_line_map, to_prob
-from .geometry import SIZE, load_geom
+from .geometry import SIZE
+from .u_detect import detect_geometry
 
 # ---------------------------------------------------------------- 判定の閾値（調整するのはここ）
 PARAMS = dict(
@@ -971,104 +631,41 @@ PARAMS = dict(
     reach_th=0.90,        # B: 漏れた光が開口部までつながっている割合
     d_lo=0.10, d_hi=0.30, # D: 相対的な暗さ（×細長さ）がこの範囲で割れらしさ 0 -> 1
     b_lo=2.5, b_hi=6.0,   # B: 周りより明るい度合いがこの範囲で割れらしさ 0 -> 1
-    min_template_score=0.5,  # テンプレートの一致度がこれ未満なら位置合わせ失敗とする
+    min_u_score=20.0,     # U字のはっきり度がこれ未満なら「U字が見つからない」としてエラー
+    hug_max=0.6,          # 経路のうち U字の縁 / 縦リブにぴったり沿っている割合がこれより多ければ、溝や影（割れではない）
+    up_max=40.0,          # 経路の終点が起点よりこれ以上 [px] 上なら割れとみなさない（脚の溝を上へ這う線を除く）
 )
 
 
-def _edge_strength(g):
-    """輪郭の強さ（明るさの変化の大きさ）。種類の判定に使う。"""
-    g = cv2.GaussianBlur(g.astype(np.float32), (0, 0), 2)
-    return cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
-
-
-class Kind:
-    """製品の種類ごとの基準（基準画像・検査範囲・テンプレート位置）。"""
-
-    def __init__(self, name, ref_gray, geom, tpl_xy, src_size):
-        self.name, self.ref, self.g = name, ref_gray, geom
-        self.tpl_xy = np.array(tpl_xy, np.float64)    # 基準画像を作ったときのテンプレート位置（入力画像の座標）
-        self.src_size = tuple(src_size)               # そのときの入力画像サイズ (幅, 高さ)
-        self.cross = Crossing(geom)
-        m = self.cross.m
-        # 種類の判定に使う範囲: 樹脂部分と縁取りの周り（開口部の中は明るさで見た目が変わるので使わない）
-        k = np.ones((25, 25), np.uint8)
-        ring = cv2.dilate(m["opening"].astype(np.uint8), k).astype(bool) & \
-            ~cv2.erode(m["opening"].astype(np.uint8), k).astype(bool)
-        self.shape_mask = m["band"] | ring
-        self.ref_edge = _edge_strength(ref_gray)
-
-    def shape_score(self, frame):
-        """frame（基準座標の画像）がこの種類の基準画像と、輪郭がどれだけ合うか（相関、1が完全一致）。"""
-        a, b = _edge_strength(frame)[self.shape_mask], self.ref_edge[self.shape_mask]
-        a = (a - a.mean()) / (a.std() + 1e-6)
-        b = (b - b.mean()) / (b.std() + 1e-6)
-        return float((a * b).mean())
-
-    def backlit(self, frame):
-        """背面光があるか: U字の開口部の中が、画像の一番明るい所に近い明るさか。"""
-        op = cv2.erode(self.cross.m["opening"].astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
-        op[: int(op.shape[0] * 0.15)] = False
-        v = frame[op]
-        return bool(len(v) and np.percentile(v, 25) > 0.6 * np.percentile(frame, 99))
-
-
-def load_kinds(ref_dir):
-    """refs/ から、基準画像・info・検査範囲の3つが揃っている種類を全部読み込む。"""
-    kinds = {}
-    for rp in sorted(glob.glob(os.path.join(ref_dir, "ref_*.png"))):
-        k = os.path.basename(rp)[4:-4]
-        ip = os.path.join(ref_dir, f"info_{k}.json")
-        g = load_geom(ref_dir, k)
-        if not os.path.exists(ip):
-            print(f"注意: {ip} が無いので {k} は検査しません（make_ref で作り直してください）"); continue
-        if g is None:
-            print(f"注意: {k} の検査範囲が無いので {k} は検査しません（draw_geom で線を引いてください）"); continue
-        with open(ip, encoding="utf-8") as f:
-            info = json.load(f)
-        kinds[k] = Kind(k, cv2.imread(rp, 0), g, info["tpl_xy"], info["src_size"])
-    return kinds
+def is_backlit(frame, opening):
+    """背面光があるか: U字の開口部の中が、画像の一番明るい所に近い明るさか。"""
+    op = cv2.erode(opening.astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+    v = frame[op]
+    return bool(len(v) and np.percentile(v, 25) > 0.6 * np.percentile(frame, 99))
 
 
 class Inspector:
-    def __init__(self, ref_dir, template_gray, params=None):
-        self.kinds = load_kinds(ref_dir)
-        if not self.kinds:
-            raise SystemExit(f"使える基準がありません: {ref_dir}（make_ref と draw_geom を先に実行してください）")
-        self.aligner = TemplateAligner(template_gray)
+    def __init__(self, params=None):
         self.p = dict(PARAMS, **(params or {}))
 
-    # ------------------------------------------------------------ 1〜3
-    def align(self, gray):
-        """位置合わせして、種類を決める。戻り値: (種類, 変換行列, 基準座標の画像, テンプレート一致度)"""
-        x, y, score = self.aligner.locate(gray)
-        if score < self.p["min_template_score"]:
-            return None, None, None, score
-        best = None
-        for k in self.kinds.values():
-            # 入力画像の大きさが基準を作ったときと違う場合は、テンプレート位置をその比率で読み替える
-            sx, sy = gray.shape[1] / k.src_size[0], gray.shape[0] / k.src_size[1]
-            offset = (k.tpl_xy[0] * sx - x, k.tpl_xy[1] * sy - y)
-            M = frame_matrix(gray.shape, offset)
-            frame = to_frame(gray, M)
-            s = k.shape_score(frame)
-            if best is None or s > best[0]:
-                best = (s, k, M, frame)
-        _, k, M, frame = best
-        return k, M, frame, score
-
-    # ------------------------------------------------------------ 全体
     def inspect(self, gray):
         p = self.p
-        kind, M, frame, tscore = self.align(gray)
-        if kind is None:
-            return dict(judgment="ERROR", reason=f"テンプレートが見つからない（一致度 {tscore:.2f}）")
-        cr = kind.cross
+        # 1. 縮小（M: 入力画像 -> 検査の座標 の変換）
+        h, w = gray.shape
+        M = np.array([[SIZE[0] / w, 0, 0], [0, SIZE[1] / h, 0], [0, 0, 1]], np.float64)
+        frame = cv2.resize(gray, SIZE, interpolation=cv2.INTER_AREA)
+
+        # 2. U字を探す
+        geom, uscore = detect_geometry(frame)
+        if uscore < p["min_u_score"]:
+            return dict(judgment="ERROR", reason=f"U字が見つからない（はっきり度 {uscore:.1f}）")
+        cr = Crossing(geom)
         band = cr.m["band"]
         res = {}
 
-        # 4-5. 割れらしさ -> 経路探索
+        # 3-5. 背面光 -> 割れらしさ -> 経路探索
+        lit = is_backlit(frame, cr.m["opening"])
         pd = to_prob(dark_line_map(frame, band), p["d_lo"], p["d_hi"])
-        lit = kind.backlit(frame)
         if lit:
             pb = to_prob(bright_gap_map(frame, band), p["b_lo"], p["b_hi"])
             res["B"] = cr.run_multi(pb, ratio_th=p["ratio_th"], gap_th=p["gap_th"])
@@ -1078,8 +675,19 @@ class Inspector:
         res["D"] = cr.run_multi(pd, ratio_th=p["ratio_th"], gap_th=p["gap_th"])
 
         # 6. 割れの定義に合うか
+        # 縁からの距離（縁に沿って走る溝・影を見分けるため）
+        dist = cv2.distanceTransform((~cr.m["opening"]).astype(np.uint8), cv2.DIST_L2, 5)   # U字の縁からの距離
+        dist_rib = cv2.distanceTransform(cr.m["plate"].astype(np.uint8), cv2.DIST_L2, 5)     # 縦リブ（プレートの端）からの距離
+        hug_d = 1.5 * geom.get("rim_width", 16) + 10
         for t, cands in res.items():
             for q in cands:
+                P = q["path"]
+                # 割れは縁から離れる方向に横切る。経路の大部分が縁や縦リブにぴったり沿っていたら、溝や影
+                q["hug"] = float(max((dist[P[:, 0], P[:, 1]] < hug_d).mean(),
+                                     (dist_rib[P[:, 0], P[:, 1]] < 25).mean()))
+                rises = P[0, 0] - P[-1, 0] > p["up_max"]          # 終点が起点よりかなり上
+                if q["hug"] > p["hug_max"] or rises:
+                    q["ng"] = False
                 start = q["path"][0][::-1].astype(np.float32)          # 起点 (x, y)
                 ends_ok = q["inner_gap"] <= p["end_gap_inner"] and q["outer_gap"] <= p["end_gap_outer"]
                 if t == "B":
@@ -1092,146 +700,23 @@ class Inspector:
                     q["ng"] = q["ng"] and ends_ok and q["rim_break"] >= p["rim_break_th"]
                 q.pop("prob", None)
 
-        # 見つけた経路を入力画像の座標に戻す（結果の描画と CSV 用）
+        # 見つけた経路・U字の線を入力画像の座標に戻す（結果の描画と CSV 用）
         Minv = np.linalg.inv(M)
+
+        def back(pts_xy):
+            return cv2.perspectiveTransform(np.asarray(pts_xy, np.float64).reshape(-1, 1, 2), Minv).reshape(-1, 2)
+
         defects = []
         for t, cands in res.items():
             for q in cands:
-                pts = q["path"][:, ::-1].reshape(-1, 1, 2).astype(np.float64)
-                q["path_img"] = cv2.perspectiveTransform(pts, Minv).reshape(-1, 2)
+                q["path_img"] = back(q["path"][:, ::-1])
                 if q["ng"]:
                     (x1, y1), (x2, y2) = q["path_img"].min(0), q["path_img"].max(0)
                     defects.append(dict(type=t, bbox=(int(x1), int(y1), int(x2), int(y2))))
         types = sorted({t for t in res if any(q["ng"] for q in res[t])})
-        return dict(kind=kind.name, backlit=lit, template_score=tscore, M=M, frame=frame, res=res,
-                    judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))
-'''
-FILES['crack_v14/make_ref.py'] = r'''"""OK画像のフォルダから、検査に使う基準画像（refs/）を作る。最初の1回だけ実行する。
-
-使い方:
-  python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
-  （このあと python -m crack_v14.draw_geom --ref-dir refs で検査範囲の線を引く）
-
-やること:
-  1. 各OK画像で template_table1.png を探し、X・Y のずれを補正して 960x660 に縮小する（検査のときと同じ）
-  2. 輪郭の似ている画像どうしを同じ「製品の種類」にまとめる（type1, type2, ... の順に名前を付ける）
-     すでに refs/ に基準画像があれば、似ている方の名前を引き継ぐ
-  3. 種類ごとに、全部を重ねた画素ごとの中央値を基準画像 ref_<種類>.png にする
-  4. テンプレートの位置などを info_<種類>.json に保存する
-
-作り直し: 検査のたびに作る必要はない（cli は refs/ を読むだけ）。
-  カメラや治具を動かした、照明を変えた、新しい種類が増えた、OK画像を増やしたいときだけ実行する。
-  同じ --out に作り直すと、基準画像と info は上書きされ、検査範囲の線（geom_*.json）はそのまま残る。
-"""
-import argparse
-import glob
-import json
-import os
-
-import cv2
-import numpy as np
-
-from .align import TemplateAligner, frame_matrix, to_frame
-
-GROUP_TH = 0.25   # 輪郭の相関がこれより大きければ同じ種類とみなす
-
-
-def load_gray(p):
-    g = cv2.imread(p, 0)
-    if g is None:
-        raise SystemExit(f"読めない画像: {p}")
-    return g
-
-
-def edge_signature(frame):
-    """種類の振り分け用: 縮小した画像の輪郭の強さ（平均0・標準偏差1にそろえたもの）。"""
-    g = cv2.resize(frame, (240, 165), interpolation=cv2.INTER_AREA).astype(np.float32)
-    g = cv2.GaussianBlur(g, (0, 0), 1.5)
-    e = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
-    return (e - e.mean()) / (e.std() + 1e-6)
-
-
-def similarity(a, b):
-    """2つの輪郭の相関（1 = 同じ、0 = 無関係）。"""
-    return float((a * b).mean())
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ok-dir", required=True, help="OK画像のフォルダ（種類が混ざっていてよい）")
-    ap.add_argument("--template", required=True, help="template_table1.png")
-    ap.add_argument("--out", default="refs")
-    ap.add_argument("--max", type=int, default=40, help="種類ごとに使う最大枚数")
-    a = ap.parse_args()
-
-    files = sorted(f for e in ("png", "jpg", "jpeg", "bmp") for f in glob.glob(os.path.join(a.ok_dir, f"*.{e}")))
-    if not files:
-        raise SystemExit(f"画像がありません: {a.ok_dir}")
-    os.makedirs(a.out, exist_ok=True)
-    aligner = TemplateAligner(load_gray(a.template))
-
-    # ---- 1. 位置補正。先頭の画像のテンプレート位置を基準にする
-    #      ただし、すでに refs/ に基準があるときはその位置を引き継ぐ（作り直しても検査範囲の線がずれないように）
-    g0 = load_gray(files[0])
-    old_info = sorted(glob.glob(os.path.join(a.out, "info_*.json")))
-    if old_info:
-        with open(old_info[0], encoding="utf-8") as fh:
-            info0 = json.load(fh)
-        tx0, ty0 = info0["tpl_xy"]
-        sx0, sy0 = g0.shape[1] / info0["src_size"][0], g0.shape[0] / info0["src_size"][1]
-        tx0, ty0 = tx0 * sx0, ty0 * sy0
-        print(f"基準のテンプレート位置: ({tx0:.0f}, {ty0:.0f})  前回の基準から引き継ぎ")
-    else:
-        tx0, ty0, s0 = aligner.locate(g0)
-        print(f"基準のテンプレート位置: ({tx0:.0f}, {ty0:.0f})  {os.path.basename(files[0])}  一致度 {s0:.2f}")
-    frames = []
-    for f in files:
-        g = load_gray(f)
-        x, y, s = aligner.locate(g)
-        if s < 0.5:
-            print(f"{os.path.basename(f)}: テンプレートが見つからないので除外（一致度 {s:.2f}）"); continue
-        sx, sy = g.shape[1] / g0.shape[1], g.shape[0] / g0.shape[0]
-        fr = to_frame(g, frame_matrix(g.shape, (tx0 * sx - x, ty0 * sy - y)))
-        frames.append((f, fr, edge_signature(fr)))
-
-    # ---- 2. 種類ごとにまとめる（すでにある基準画像があれば、その種類から始める）
-    groups = {}                              # 名前 -> {"sigs": [...], "items": [...]}
-    for p in sorted(glob.glob(os.path.join(a.out, "ref_*.png"))):
-        name = os.path.basename(p)[4:-4]
-        groups[name] = dict(sigs=[edge_signature(load_gray(p))], items=[])
-    for f, fr, sig in frames:
-        best, best_s = None, GROUP_TH
-        for name, gr in groups.items():
-            s = max(similarity(sig, t) for t in gr["sigs"])     # その種類の誰かと似ていれば同じ種類
-            if s > best_s:
-                best, best_s = name, s
-        if best is None:
-            best = f"type{len(groups) + 1}"
-            groups[best] = dict(sigs=[], items=[])
-        groups[best]["sigs"].append(sig)
-        if len(groups[best]["items"]) < a.max:
-            groups[best]["items"].append((f, fr))
-    print("振り分け: " + ", ".join(f"{k}={len(v['items'])}枚" for k, v in sorted(groups.items()) if v["items"]))
-
-    # ---- 3〜4. 種類ごとに中央値をとって保存
-    for name, gr in sorted(groups.items()):
-        if not gr["items"]:
-            continue
-        st = np.stack([fr for _, fr in gr["items"]]).astype(np.float32)
-        med = np.median(st, axis=0)
-        mad = np.median(np.abs(st - med), axis=0) * 1.4826     # OK品のばらつき（OK差分モデル用に保存）
-        cv2.imwrite(os.path.join(a.out, f"ref_{name}.png"), np.clip(med, 0, 255).astype(np.uint8))
-        np.save(os.path.join(a.out, f"ok_mad_{name}.npy"), mad)
-        with open(os.path.join(a.out, f"info_{name}.json"), "w", encoding="utf-8") as fh:
-            json.dump(dict(tpl_xy=[tx0, ty0], src_size=[g0.shape[1], g0.shape[0]], n_images=len(gr["items"]),
-                           images=[os.path.basename(f) for f, _ in gr["items"]]), fh, ensure_ascii=False, indent=1)
-        has_geom = os.path.exists(os.path.join(a.out, f"geom_{name}.json"))
-        print(f"[{name}] {len(gr['items'])} 枚から作成 -> {a.out}/ref_{name}.png"
-              + ("" if has_geom else f"   ※ 次に draw_geom で {name} の線を引いてください"))
-
-
-if __name__ == "__main__":
-    main()
+        u_img = dict(rim=back(geom["opening"][1:-1]), ribs=[back(line) for line in geom["outer"][:2]])
+        return dict(kind="auto", backlit=lit, u_score=uscore, geom=geom, u_img=u_img, M=M, frame=frame,
+                    res=res, judgment="NG" if defects else "OK", defects=defects, detail="+".join(types))
 '''
 FILES['crack_v14/screen_crop.py'] = r'''"""（テスト用）モニターをスマホで撮った写真から、画面の部分だけを切り出して 960x660 にする。本番では使わない。"""
 import cv2, numpy as np
@@ -1258,7 +743,241 @@ def crop_screen(im, W=960, H=660):
     M = cv2.getPerspectiveTransform(src, np.float32([[0, 0], [W, 0], [W, H], [0, H]]))
     return cv2.warpPerspective(im, M, (W, H))
 '''
+FILES['crack_v14/u_detect.py'] = r'''"""1枚の画像から、U字の開口部・縁取り・縦リブを自動で見つける（製品の種類を問わない）。
+
+考え方:
+  どの製品でも共通しているのは「U字の縁取りは白く光っていて、そのすぐ外側は黒い樹脂のプレート」
+  ということ。そこで、U字の内側のある点（中心）から放射状に線を伸ばし、各方向で
+      内側が明るく -> 外側が暗い（縁取りの外側の境目）
+      その外側はなめらかで模様が少ない（樹脂のプレート）
+  となる距離を探す。方向ごとにバラバラに選ぶとガタガタになるので、
+  「隣の方向との距離の差は小さく」という条件で、ぐるっと一周分を動的計画法でまとめて選ぶ。
+  中心の位置は分からないので、いくつか試して一番はっきりU字になったものを使う。
+
+  そのあと:
+    縁取りの線をもう一度細かく境目に吸い付け、縁取りの太さを測る（snap_rim）
+    U字の脚の外側で一番はっきりした縦の線を縦リブとする（find_ribs）
+    U字の一番下（6時の位置）をゲートの切り欠きとして、縁取りの途切れ判定から外す
+"""
+import cv2
+import numpy as np
+
+from .geometry import SIZE, build_masks
+
+ANGLES = np.deg2rad(np.arange(0, 182, 2))     # 真右 -> 真下 -> 真左（画像は下向きが +y）。脚はそこから真上に伸ばす
+R_STEP = 2.0
+OUT = 50          # 外側を何 px 先までなめらかか調べるか
+W_OUT = 0.8       # 外側の模様の多さの減点の重み
+R_BONUS = 0.0     # 1px 外側ほど得する点数
+
+
+def _smooth(a, k):
+    """点の並びを前後 k 点の平均でなめらかにする（両端はそのまま伸ばす）。"""
+    if k <= 1 or len(a) < k:
+        return a
+    pad = np.concatenate([np.repeat(a[:1], k // 2, 0), a, np.repeat(a[-1:], k // 2, 0)])
+    ker = np.ones(k) / k
+    return np.stack([np.convolve(pad[:, i], ker, mode="valid") for i in range(a.shape[1])], 1)
+
+
+def _dp_path(score, max_jump, penalty):
+    """score[角度, 距離] の表で、隣の角度との距離の差が max_jump 以内の、合計が一番大きい道。"""
+    A, R = score.shape
+    acc = score[0].copy()
+    back = np.zeros((A, R), np.int64)
+    idx = np.arange(R)
+    for i in range(1, A):
+        best = np.full(R, -1e18)
+        arg = np.zeros(R, np.int64)
+        for sh in range(-max_jump, max_jump + 1):
+            prev = np.full(R, -1e18)
+            if sh >= 0:
+                prev[sh:] = acc[: R - sh]
+            else:
+                prev[:sh] = acc[-sh:]
+            prev = prev - penalty * abs(sh)
+            m = prev > best
+            best[m], arg[m] = prev[m], idx[m] - sh       # 前の角度での距離の番号
+        acc = best + score[i]
+        back[i] = arg
+    path = np.zeros(A, np.int64)
+    path[-1] = int(np.argmax(acc))
+    for i in range(A - 1, 0, -1):
+        path[i - 1] = back[i, path[i]]
+    return path, float(acc.max()) / A
+
+
+def _polar_score(img, edge, cx, cy, radii):
+    """中心 (cx, cy) から見た「縁取りの外側の境目らしさ」の表 [角度, 距離]。"""
+    H, W = img.shape
+    rr = np.arange(radii[0] - 30, radii[-1] + OUT + 30, R_STEP)          # 前後に余裕を持たせて一度に取る
+    X = (cx + np.outer(np.cos(ANGLES), rr)).astype(np.float32)
+    Y = (cy + np.outer(np.sin(ANGLES), rr)).astype(np.float32)
+    inside = (X >= 0) & (X < W - 1) & (Y >= 0) & (Y < H - 1)
+    I = cv2.remap(img, X, Y, cv2.INTER_LINEAR)
+    E = cv2.remap(edge, X, Y, cv2.INTER_LINEAR)
+    o = int(30 / R_STEP)                                              # radii[0] が rr の何番目か
+    n = len(radii)
+    k3 = int(round(3 / R_STEP))
+    step = I[:, o - k3:o - k3 + n] - I[:, o + k3:o + k3 + n]          # 内側 3px - 外側 3px（内が明るいと +）
+    # 外側 6〜OUT px の輪郭の強さの平均（樹脂のプレートなら小さい）。
+    # ネジ筒などの輪郭の外側には、すぐ U字の縁取りなど別の線があるので大きくなる
+    cs = np.cumsum(np.pad(E, ((0, 0), (1, 0))), axis=1)
+    a, b = int(6 / R_STEP), int(OUT / R_STEP)
+    out_edge = (cs[:, o + b + 1:o + b + 1 + n] - cs[:, o + a:o + a + n]) / (b - a + 1)
+    # 外側ほど少し得をさせる（同じくらいはっきりした境目なら、一番外の縁取りを選ぶ）
+    s = np.clip(step, 0, 60) - W_OUT * out_edge + R_BONUS * radii[None, :]
+    ok = inside[:, o:o + n] & inside[:, o + b:o + b + n]
+    return np.where(ok, s, -5.0)
+
+
+def find_rim(frame):
+    """U字の縁取りの外側の線を探す。戻り値: (点の並び 左の脚 -> 底 -> 右の脚, 中心, はっきり度)"""
+    H, W = frame.shape
+    img = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 1.5)
+    g = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 1.0)
+    edge = cv2.magnitude(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+    edge = np.clip(edge / (np.percentile(edge, 99) + 1e-6) * 60, 0, 60).astype(np.float32)
+    radii = np.arange(20, 0.75 * W, R_STEP)
+    best = None
+    for cx in np.linspace(0.3 * W, 0.7 * W, 9):
+        for cy in np.linspace(0.05 * H, 0.55 * H, 6):
+            sc = _polar_score(img, edge, cx, cy, radii)
+            path, total = _dp_path(sc, max_jump=8, penalty=0.6)
+            if best is None or total > best[0]:
+                best = (total, cx, cy, path)
+    total, cx, cy, path = best
+    # 中心を細かく寄せる
+    for d in (12, 4):
+        for dx, dy in ((d, 0), (-d, 0), (0, d), (0, -d)):
+            sc = _polar_score(img, edge, cx + dx, cy + dy, radii)
+            p2, t2 = _dp_path(sc, max_jump=8, penalty=0.6)
+            if t2 > total:
+                total, cx, cy, path = t2, cx + dx, cy + dy, p2
+    r = radii[path]
+    arc = _smooth(np.c_[cx + r * np.cos(ANGLES), cy + r * np.sin(ANGLES)][::-1], 5)   # 左 -> 底 -> 右
+    # 真横に近い方向は縦リブなど外側の線を拾いやすいので使わず（両端 6 点 = 12°ぶん捨てる）、
+    # そこから上は、U字の脚を1行ずつ上へ追いかける（脚がまっすぐでも、広がっていても合う）
+    arc = arc[6:-6]
+    left = trace_leg(img, edge, arc[0], side=-1)
+    right = trace_leg(img, edge, arc[-1], side=+1)[::-1]
+    return np.vstack([left, arc, right]), (cx, cy), total
+
+
+def trace_leg(img, edge, start, side, row_step=4, search=40, max_shift=3):
+    """U字の脚の縁取りの外側の線を、start から画像の上端まで1行ずつ追いかける。
+
+    各行で、start の x から ±search px の範囲について「内側（U字の中心側）が明るく、外側が暗く、
+    その外側がなめらか」な強さを測り、隣の行とのずれが max_shift px 以内でなめらかにつながる道を
+    動的計画法で選ぶ。side = -1 は左の脚（外側は左）、+1 は右の脚（外側は右）。
+    """
+    H, W = img.shape
+    ys = np.arange(start[1], -1, -row_step)                   # start から上へ
+    xs = np.arange(start[0] - search, start[0] + search + 1, 1.0)
+    X, Y = np.meshgrid(xs, ys)
+
+    def at(M, dx):
+        xx = np.clip(X + dx, 0, W - 1).astype(np.float32)
+        return cv2.remap(M, xx, Y.astype(np.float32), cv2.INTER_LINEAR)
+    step = at(img, -3 * side) - at(img, 3 * side)                 # 内側 - 外側（内が明るいと +）
+    out_edge = np.mean([at(edge, d * side) for d in range(6, OUT + 1, 6)], axis=0)
+    sc = np.clip(step, 0, 60) - W_OUT * out_edge
+    sc[0] -= 0.5 * np.abs(xs - start[0])                          # 1行目は start の近くから始める
+    idx, _ = _dp_path(sc, max_jump=max_shift, penalty=1.0)
+    pts = np.c_[xs[idx], ys]
+    return pts[::-1][:-1]                                         # 上端 -> start の手前（start は arc 側にある）
+
+
+def snap_rim(ref, rim, search=10, step=4.0, smooth_penalty=2.0):
+    """縁取りの線を、近くの本当の境目（外側の暗い樹脂 -> 内側の明るい縁取り）に細かく吸い付け、
+    縁取りの太さも測る。戻り値: (点の並び, 縁取りの太さ[px])"""
+    pts = np.array(rim, np.float64)
+    seg = [np.linspace(a, b, max(2, int(np.hypot(*(b - a)) / step)), endpoint=False) for a, b in zip(pts[:-1], pts[1:])]
+    c = _smooth(np.vstack(seg + [pts[-1:]]), 9)
+    t = np.gradient(c, axis=0)
+    t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+    n = np.stack([-t[:, 1], t[:, 0]], 1)
+    poly = np.array([(c[0][0], 0)] + c.tolist() + [(c[-1][0], 0)], np.float32).reshape(-1, 1, 2)
+    flip = np.array([cv2.pointPolygonTest(poly, (float(x + 6 * u), float(y + 6 * v)), False) < 0
+                     for (x, y), (u, v) in zip(c, n)])
+    n[flip] *= -1                                         # 法線を開口部の内側へ向ける
+    img = cv2.GaussianBlur(ref.astype(np.float32), (0, 0), 1.5)
+
+    def val(q):
+        x = np.clip(q[:, 0], 0, ref.shape[1] - 1).astype(np.float32)
+        y = np.clip(q[:, 1], 0, ref.shape[0] - 1).astype(np.float32)
+        return cv2.remap(img, x.reshape(1, -1), y.reshape(1, -1), cv2.INTER_LINEAR).ravel()
+
+    ds = np.arange(-search, search + 1)
+    gain = np.clip(np.stack([val(c + (d + 2) * n) - val(c + (d - 2) * n) for d in ds], 1), -40, 80)
+    d_idx, _ = _dp_path(gain, max_jump=1, penalty=smooth_penalty)
+    out = _smooth(c + ds[d_idx][:, None] * n, 5)
+
+    # 縁取りの太さ: 外側の境目から内側へ進み、明るい縁取りが終わって暗くなる所までの距離
+    ws = np.arange(4, 46)
+    fall = np.stack([val(out + (w + 2) * n) - val(out + (w - 2) * n) for w in ws], 1)
+    strong = fall.min(1) < -15
+    width = float(np.median(ws[np.argmin(fall, 1)][strong])) if strong.any() else 16.0
+    return [(float(x), float(y)) for x, y in out], width
+
+
+def find_ribs(frame, left_leg, right_leg, y_from):
+    """U字の脚のすぐ外側（gap〜reach px）で、一番はっきりした縦の線を縦リブとする。"""
+    H, W = frame.shape
+    g = cv2.GaussianBlur(frame.astype(np.float32), (0, 0), 2)
+    gx = np.abs(cv2.Sobel(g, cv2.CV_32F, 1, 0))
+    prof = gx[int(min(H - 20, y_from)):, :].mean(0)
+    prof = np.convolve(prof, np.ones(5) / 5, mode="same")
+    gap, reach = 6, max(50.0, 0.3 * (right_leg - left_leg) / 2)
+    lo, hi = int(max(4, left_leg - reach)), int(max(5, left_leg - gap))
+    lx = lo + int(np.argmax(prof[lo:hi])) if hi > lo else int(max(2, left_leg - gap))
+    lo, hi = int(min(W - 5, right_leg + gap)), int(min(W - 4, right_leg + reach))
+    rx = lo + int(np.argmax(prof[lo:hi])) if hi > lo else int(min(W - 3, right_leg + gap))
+    return float(lx), float(rx)
+
+
+def detect_geometry(frame, edge_margin=10, min_thick=30):
+    """1枚の画像（基準座標 960x660）から検査範囲を作る。戻り値: (検査範囲, はっきり度)"""
+    W, H = SIZE
+    rim0, (cx, cy), total = find_rim(frame)
+    rim, width = snap_rim(frame, rim0.tolist())
+    rim = np.array(rim)
+    bottom = rim[np.argmax(rim[:, 1])]
+    top_y = float(rim[:, 1].min())
+    mid = rim[(rim[:, 1] > top_y + 0.2 * (bottom[1] - top_y)) & (rim[:, 1] < bottom[1] - 0.2 * (bottom[1] - top_y))]
+    mid = mid if len(mid) else rim
+    lx, rx = find_ribs(frame, mid[:, 0].min(), mid[:, 0].max(), bottom[1] - 0.3 * (bottom[1] - top_y))
+    half = (rim[:, 0].max() - rim[:, 0].min()) / 2
+    gw = max(18.0, 0.12 * half)                               # ゲートの切り欠きの範囲（U字の大きさに比例）
+    g = dict(
+        y_eval=int(max(top_y + 10, cy - 0.15 * H)),        # 脚の一番上（ふちの近く）は検査しない edge_margin=edge_margin, min_thick=min_thick, rim_width=width,
+        opening=[(float(rim[0][0]), 0.0)] + [tuple(map(float, p)) for p in rim] + [(float(rim[-1][0]), 0.0)],
+        plate=[(lx, 0.0), (rx, 0.0), (rx, H - 1.0), (lx, H - 1.0)],
+        rim_ignore=[(float(bottom[0] - gw), float(bottom[1] - 15), float(bottom[0] + gw), float(bottom[1] + 60))],
+        outer=[[(lx + 2, 0.0), (lx + 2, H - 1.0)], [(rx - 2, 0.0), (rx - 2, H - 1.0)], [(lx, H - 3.0), (rx, H - 3.0)]],
+        center=(float(cx), float(cy)), score=float(total),
+    )
+    return g, float(total)
+
+
+def draw_geometry(frame, g):
+    """検査範囲を画像に重ねた確認用の画像（緑 = 縁取りの外側、赤 = 縦リブと下端、青 = 探す範囲）。"""
+    m = build_masks(g)
+    vis = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    over = vis.copy()
+    over[m["band"]] = (200, 80, 0)
+    vis = cv2.addWeighted(over, 0.25, vis, 0.75, 0)
+    vis[m["inner"]] = (0, 220, 0)
+    vis[m["outer"]] = (0, 0, 255)
+    for x0, y0, x1, y1 in g.get("rim_ignore", []):
+        cv2.rectangle(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
+    return vis
+'''
 FILES['crack_v14/README.md'] = r'''# カセットワレ検査 V14
+
+## 特長
+**製品の種類（U字の太さ・形・刻印）を問わず、設定なしで動く。**
+基準画像・テンプレート・検査範囲の線引きは不要。U字は1枚ごとに、その画像の中から自動で見つける。
 
 ## 割れの定義
 U字の内側（開口部）から外縁（左右の縦リブ・下端）まで、**端から端まで割れているもの**だけを NG にする。
@@ -1266,16 +985,16 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 
 - **B** = 明るい割れ（割れ目から背面光が漏れて白く見える）。背面光がある画像だけ検査
 - **D** = 暗い割れ（黒い割れ線）。全部の画像で検査
-- **製品の種類** = type1（U字の脚が上まで長く見える）/ type2（U字の内側にネジ筒が見える）
 
 ## 処理の流れ（inspect_v14.py）
-1. **位置合わせ**: `template_table1.png`（右側のネジ2つと留め具）を `cv2.matchTemplate` で探し、X・Y のずれを補正して 960x660 に縮小（align.py）
-2. **種類の判定**: 種類ごとの基準画像と輪郭を比べ、よく合う方にする（明るさは使わない）
-3. **背面光の判定**: U字の開口部が明るいか
-4. **割れらしさ**: 画素ごとに割れっぽさを 0〜1 で数値化（features.py）
-   - D: 周りより暗く、細長い所
-   - B: 周りの樹脂より明るい所
-5. **経路探索**: 内縁から外縁まで、割れっぽい所だけを通って抜けられる道を探す（crossing.py, geodesic.py）
+1. **縮小**: 入力画像を 960x660 にする
+2. **U字を探す**（u_detect.py）: 「縁取りは白く光り、その外側は黒くなめらかな樹脂」という、
+   どの製品にも共通する特徴で U字の縁取りを探す。U字の中から放射状に線を伸ばし、
+   一周分を動的計画法でなめらかにつなぐ。脚は1行ずつ上へ追いかける。
+   縦リブは脚のすぐ外側の一番はっきりした縦の線、ゲートの切り欠きは U字の一番下とする
+3. **背面光の判定**: U字の開口部の中が明るいか
+4. **割れらしさ**（features.py）: 画素ごとに割れっぽさを 0〜1 で数値化
+5. **経路探索**（crossing.py）: 内縁から外縁まで、割れっぽい所だけを通って抜けられる道を探す
 6. **判定**: 下の条件を全部満たす道があれば NG
 
 ## 判定の条件と閾値（inspect_v14.py の PARAMS）
@@ -1287,54 +1006,40 @@ U字の内側（開口部）から外縁（左右の縦リブ・下端）まで�
 | end_gap_outer | 25 px | 割れが外側の端から手前で止まってよい距離 | 半割れも NG になりやすい |
 | rim_break_th | 0.30 | D: 起点で U字の縁取りが切れている度合いの下限 | 過検出が減り、見逃しが増える |
 | reach_th | 0.90 | B: 漏れた光が開口部までつながっている割合の下限 | 過検出が減り、見逃しが増える |
+| hug_max | 0.6 | 経路が縁・縦リブにぴったり沿っている割合の上限（溝や影を除く） | 過検出が増える |
+| up_max | 40 px | 終点が起点よりこれ以上上なら割れとみなさない | 過検出が増える |
 | d_lo / d_hi | 0.10 / 0.30 | D: 暗さ（×細長さ）を割れらしさ 0〜1 にする範囲 | 薄い線を拾いにくくなる |
 | b_lo / b_hi | 2.5 / 6.0 | B: 明るさを割れらしさ 0〜1 にする範囲 | 淡い光漏れを拾いにくくなる |
+| min_u_score | 20 | U字のはっきり度の下限（下回ると ERROR） | U字が見つからない扱いが増える |
 
 ## 使い方
 ```
 pip install -r requirements.txt
-
-# 1. 基準画像を作る（最初の1回）。OK画像のフォルダは製品の種類が混ざっていてよい（自動で振り分け）
-python -m crack_v14.make_ref --ok-dir pos1ok --template template_table1.png --out refs
-
-# 2. 検査範囲の線を引く（種類ごとに1回）。基準画像が表示されるのでクリックする
-python -m crack_v14.draw_geom --ref-dir refs
-#    手順: (1) U字の縁取りの外側を左の脚の上→底→右の脚の上 (2) 左の縦リブ 上下2点 (3) 右の縦リブ 上下2点
-#          (4) ゲートの切り欠きを囲む四角 2点（無ければEnter） (5) 検査を始める高さ 1点
-#    左クリック=点、右クリック=戻す、Enter=次へ。大まかでよい（縁取りの境目に自動で吸い付ける）
-#    終わると refs/check_<種類>.jpg が出るので確認する
-#    すでに線があるときは、クリックし直さずに吸い付けだけやり直せる:
-python -m crack_v14.draw_geom --ref-dir refs --resnap
-
-# 3. 検査
-python -m crack_v14.cli --input <画像フォルダ> --template template_table1.png --ref-dir refs --out out
-
-# 4. 正解CSVとの比較
+python -m crack_v14.cli --input <画像フォルダ> --out out
 python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out --role VALIDATION
 ```
+出力画像には、見つけた割れ（水色 = B、赤 = D）に加えて、見つけた U字の縁取り（細い緑）と
+縦リブ（細い黄色）を描く。U字の見つけ方がおかしくないか、ここで確認できる。
 
 ## ファイル
 | ファイル | 中身 |
 |---|---|
 | cli.py | 検査の実行、結果の描画と CSV 出力 |
 | inspect_v14.py | 検査の流れと判定（閾値はここ） |
-| align.py | テンプレートマッチングでの位置合わせ |
+| u_detect.py | U字・縁取り・縦リブ・ゲートを画像から自動で見つける |
 | features.py | 割れらしさマップ（B・D） |
 | crossing.py | 内縁 -> 外縁の経路探索、縁取りの途切れ |
 | geodesic.py | 最短経路探索（ダイクストラ法） |
-| geometry.py | 検査範囲の座標とマスク |
-| make_ref.py | OK画像から基準画像を作る（最初の1回） |
-| draw_geom.py | 基準画像の上でクリックして検査範囲の線を引く（種類ごとに1回） |
+| geometry.py | 検査範囲からマスク画像を作る |
 | evaluate.py | 正解CSVとの比較 |
 | screen_crop.py | （テスト用）画面撮影写真の切り出し |
 
 ## 未確認のこと
-- OK画像での過検出率（OK画像で回していないので不明）
-- 本物の template_table1.png・実画像での動作（テストは画面写真を加工したもので実施）
-- No.16 の中央の細い線は検出できていない（同じ位置に成形線があり、OK画像との比較が必要）
+- OK画像での過検出率（OK画像で回していない）
+- 実画像での動作（テストは画面をスマホで撮った写真で実施）
 '''
 FILES['requirements.txt'] = r'''# 動作確認済み: Python 3.12 / opencv 4.9.0 / numpy 1.26.4 / numba 0.60.0
-opencv-python>=4.4      # draw_geom の画面表示に必要（headless 版は不可）
+opencv-python>=4.4      # headless 版でも可
 numpy>=1.24
 numba>=0.57             # 無くても動く（最短経路が純Pythonになり遅くなる）
 '''
