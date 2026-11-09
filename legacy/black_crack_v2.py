@@ -46,6 +46,8 @@ BLACK_V2_PARAMS = {
     "black_follow_gap": 12,       # 暗くない所がこれ以上続いたら、つながっていないとみなす [px]
     # 割れとみなす条件
     "black_min_len": 150,         # 線のまとまりの長さの下限 [px]
+    "black_line_ratio": 0.6,      # 細長さ（短い方向の広がり ÷ 長い方向の広がり）がこれより大きければ塊（刻印・ロゴ）
+    "black_hole_ratio": 0.1,      # 線が囲む穴の面積が、線の面積のこの割合より大きければ刻印・ロゴ
     "black_far_dist": 30,         # 縁取りからこれより離れた部分を「縁から離れた部分」とする [px]
     "black_far_len": 100,         # 縁から離れた部分・一本の線として続く部分の長さの下限 [px]
     "black_edge_tol": 12,         # 外縁からこの距離以内に来ていれば「外縁に届いた」 [px]
@@ -239,6 +241,15 @@ def find_crossing_cracks(ary, binary, mask, roi_lr, gate_x, top_row, p):
         # 細かい汚れや刻印が集まっただけのまとまりは割れではない。一本の線として十分長い部分があること
         sn, _, sst, _ = cv2.connectedComponentsWithStats(comp.astype(np.uint8))
         if max(np.hypot(sst[j, cv2.CC_STAT_WIDTH], sst[j, cv2.CC_STAT_HEIGHT]) for j in range(1, sn)) < p["black_far_len"]:
+            continue
+        # 刻印の文字やロゴを除く。割れは細長い線で、線が閉じて穴を作ることはほとんどない。
+        # 文字やロゴは塊（細長くない）か、線が閉じて穴がある（リサイクルマークの三角、A・D・O など）
+        ev = np.sort(np.linalg.eigvalsh(np.cov(np.c_[xs, ys].T.astype(float))))
+        if np.sqrt(max(ev[0], 0) / max(ev[1], 1e-6)) > p["black_line_ratio"]:   # 細長さ = 短い方向 ÷ 長い方向の広がり
+            continue
+        cs, hier = cv2.findContours(comp.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)[-2:]
+        holes = sum(cv2.contourArea(c) for c, hh in zip(cs, hier[0]) if hh[3] >= 0) if hier is not None else 0
+        if holes > p["black_hole_ratio"] * comp.sum():
             continue
         # 内側の端が縁取りに届いているか（届いていなければ、暗い所をたどって届くか）
         if _touches_rim(comp, d_out, rim, p) or _follow_to_rim(comp, ary, d_out, rim, plate, p):
