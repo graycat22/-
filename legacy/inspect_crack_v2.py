@@ -119,6 +119,10 @@ DEFAULT_PARAMS = {
     "th_black_level": 18,
     "template_threshold": 0.0,
     # ---- v2 の黒ワレ判定用 ----
+    "black_groove_dist": 60,    # 端からこの距離以内を縦に走る細い線は「縦リブの内側の溝」とみなして除く [px]
+    "black_groove_width": 30, "black_groove_frac": 0.5, "black_groove_pad": 12,   # その線の横幅がこれ未満なら溝（割れは斜めに走るので横幅が出る） [px]
+    "black_edge_margin": 15,    # カセットの左右の端からこの幅は探さない（縦リブの黒い線） [px]
+    "black_top_cut": 0.2,       # 切り出しの上からこの割合 × radius の行は見ない（カセットの上の縁を拾わないため）
     "black_inner_ratio": 1.0,   # 探す範囲の内側の円の半径（radius の何倍か）
     "black_gate_half": 40,      # 中央のゲート（成形線）として除外する幅の半分 [px]
     "black_bh_th": 20,          # ブラックハット（周りより暗い度合い）がこれより大きい画素を黒い線とみなす
@@ -339,6 +343,11 @@ class BaseCrackInspector:
     ):
         """黒ワレ判定 v2: U字の縁から外縁まで黒い線がつながっていれば NG。"""
         p = self.params
+        # 探す範囲は赤い ROI ではなく、カセットのプレート全体（左右はカセットの端まで、上は U字の脚まで）
+        roi_left, roi_right = left_lim, right_lim
+        if getattr(self, "_cassette_lr", None) is not None:
+            left_lim = max(0, int(self._cassette_lr[0]))
+            right_lim = min(ary_gray.shape[1], int(self._cassette_lr[1]))
         y0 = max(0, top_lim - radius)
         ary_interest = ary_gray[y0:bottom_lim, left_lim:right_lim]
         if ary_interest.size == 0:
@@ -349,17 +358,19 @@ class BaseCrackInspector:
         y_top_l = top_lim - y0                       # 元の ROI の上端（U字の底のあたり）
 
         # 探す範囲: U字の外側の帯（元と同じ円の帯）。中央はゲートの所だけ除く
-        mask = np.zeros_like(ary_interest)
-        cv2.circle(mask, (cxl, cy_l), int(radius * 1.75), 255, -1)
+        mask = np.full_like(ary_interest, 255)                # プレート全体（元は半径 1.75R の円の中だけ）
         # 内側の円は radius より少し小さくする（pos2 などで U字が円より小さいと、割れの根元が円の中に隠れるため）。
         # U字の開口部の中を拾わないことは、あとの「縁取りに届いているか」の判定で保証する
         cv2.circle(mask, (cxl, cy_l), int(radius * p["black_inner_ratio"]), 0, -1)
-        mask[:radius // 2] = 0
+        mask[:int(radius * p["black_top_cut"])] = 0         # U字の脚の上の方まで見る（元は radius/2 より上を捨てていた）
+        em = p["black_edge_margin"]                          # カセットの左右の端（縦リブの黒い線）は割れではないので除く
+        mask[:, :em] = 0
+        mask[:, max(0, w - em):] = 0
         g = p["black_gate_half"]
         mask[y_top_l - 20:, max(0, cxl - g):cxl + g] = 0   # ゲートより下の成形線だけ除外
 
         # 細い線を残したまま、周りより暗い線を取り出す（元の CLOSE(11) は細い線を消すのでやめた）
-        th_clip = int(np.percentile(ary_gray[top_lim:bottom_lim, left_lim:right_lim], 50))
+        th_clip = int(np.percentile(ary_gray[top_lim:bottom_lim, roi_left:roi_right], 50))
         soft = cv2.GaussianBlur(ary_interest.clip(0, th_clip), (3, 3), 0)
         blackhat = np.max([
             cv2.morphologyEx(soft, cv2.MORPH_BLACKHAT, kern,
@@ -370,8 +381,28 @@ class BaseCrackInspector:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (p["black_join"], p["black_join"]))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k) & (mask > 0)
 
+        # 縦リブの内側の溝を消す: 溝はカセットの上から下まで同じ列に続く。割れは斜めに横切るので、
+        # ひとつの列に乗っている長さは短い。端の近くで「列の black_groove_frac 以上が暗い」列を溝として消す
+        gd = p["black_groove_dist"]
+        rows = np.arange(h) >= int(radius * p["black_top_cut"])
+        wide = cv2.dilate(binary, np.ones((1, 7), np.uint8))           # 写真のガタつき（左右 ±3px）を吸収
+        col_frac = wide[rows].mean(axis=0)
+        groove_cols = (col_frac > p["black_groove_frac"]) & ((np.arange(w) < gd) | (np.arange(w) >= w - gd))
+        gw = p["black_groove_pad"]
+        groove_cols = cv2.dilate(groove_cols.astype(np.uint8)[None, :], np.ones((1, 2 * gw + 1), np.uint8))[0] > 0
+        binary[:, groove_cols] = 0
+        # 溝より外（端の側）は割れを探さない。溝まで来た割れは「外縁に届いた」とみなす
+        cols = np.nonzero(groove_cols)[0]
+        out_l = int(cols[cols < w // 2].max()) + 1 if (cols < w // 2).any() else 0
+        out_r = int(cols[cols >= w // 2].min()) if (cols >= w // 2).any() else w
+
         # 周りのプレートの明るさ（相対的な暗さの基準）
-        plate = float(np.median(ary_interest[mask > 0])) if (mask > 0).any() else 255.0
+        # 基準は元と同じ「U字のまわりの円の帯（R〜1.75R）」で測る（プレート全体だと縦リブや背景の明るさが混ざる）
+        ref = np.zeros_like(mask)
+        cv2.circle(ref, (cxl, cy_l), int(radius * 1.75), 255, -1)
+        cv2.circle(ref, (cxl, cy_l), radius, 0, -1)
+        ref &= mask
+        plate = float(np.median(ary_interest[ref > 0])) if (ref > 0).any() else 255.0
 
         yy, xx = np.mgrid[0:h, 0:w]
         dist_center = np.hypot(xx - cxl, yy - cy_l)
@@ -448,8 +479,12 @@ class BaseCrackInspector:
 
         e = p["black_edge_tol"]
         near_outer = np.zeros((h, w), bool)
-        near_outer[:, :e] = True
-        near_outer[:, w - e:] = True
+        # 外縁 = 縦リブの内側の線。元の赤い ROI の左右の辺がだいたいそこなので、それも外縁に数える
+        # （溝が見つかった時はその溝、見つからない時は ROI の辺。どちらか内側の方）
+        in_l = max(em, out_l, roi_left - left_lim)
+        in_r = min(w - em, out_r, roi_right - left_lim)
+        near_outer[:, :max(0, in_l) + e] = True              # 除いた帯（端・溝・リブ）のすぐ内側まで来ていれば「外縁に届いた」
+        near_outer[:, max(0, in_r - e):] = True
         if p["black_outer_bottom"]:
             near_outer[h - e:, :] = True                         # 下端も外縁に数える（既定は数えない）
 
@@ -481,6 +516,11 @@ class BaseCrackInspector:
             radial = float(dc.max() - dc.min())                  # 中心から外へ向かう長さ（縁に沿う影は小さい）
             ys_, xs_ = np.nonzero(comp)
             gate_line = np.mean(np.abs(xs_ - cxl) < p["black_gate_half"] * 2) > 0.5   # 大部分がゲートの真下（成形線）
+            # 縦リブの内側の溝: 端の近くを、ほぼ縦にまっすぐ走る線（割れは端に向かって斜めに横切る）
+            edge_d = np.minimum(xs_, w - 1 - xs_)
+            if (np.mean(edge_d < p["black_groove_dist"]) > 0.6
+                    and (xs_.max() - xs_.min()) < p["black_groove_width"]):
+                continue
             if (near_outer[comp].any() and radial >= p["black_min_radial"] * radius
                     and not gate_line and (touches_rim(comp) or follow_to_rim(comp))):
                 crossing += cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL,
@@ -519,6 +559,7 @@ class BaseCrackInspector:
         self.frame = frame
         ary_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         left_lim, right_lim, cx = self._find_cassette_limits(ary_gray)
+        self._cassette_lr = (left_lim, right_lim)          # 黒ワレはカセットの端まで探す
         max_loc, max_loc_rel, template_score = self._match_template(frame)
         roi = self._select_roi(left_lim, right_lim, max_loc_rel)
 
