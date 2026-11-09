@@ -3,6 +3,7 @@
 展開したあと（基準画像・テンプレート・線引きは不要）:
   pip install -r requirements.txt
   python -m crack_v14.cli --input <画像フォルダ> --out out
+  python -m crack_v14.screen_fix <PC直撮りの写真フォルダ> <補正後フォルダ> --ref <見本フォルダ>   # 画面を直接撮った写真用
   python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out
 詳しくは crack_v14/README.md
 """
@@ -1500,9 +1501,14 @@ python -m crack_v14.evaluate --labels labels/defect_annotations.csv --pred out -
 | evaluate.py | 正解CSVとの比較 |
 | screen_crop.py | （テスト用）画面撮影写真の切り出し |
 
-## 確認済み（画面撮影の画像）
-- OK 94枚: すべて OK（過検出 0）
-- NG 20枚: 19枚 NG、位置も一致。見逃し 1枚（No.16 の中央の細い線）
+## 固定版 v14-freeze の位置づけ
+以下の数字は **調整に使った画像での成績**（本番の精度はこれより下がる前提で見ること）。
+- OK: pos1 94枚 + pos2 63枚 = 157枚すべて OK
+- NG: pos1_ng 18/20、pos2_ng（screen_fix で補正後）6/8、画面写真 18/20
+- 余裕の小さい閾値: b_ratio_th 0.42（本物 最大0.38 / 反射 0.48）、ratio_th 0.30（本物 最大0.25 / 傷 0.31）
+
+評価のルール: 未使用の validation / test 画像では閾値を触らず、evaluate.py で数字だけ出す。
+外れた画像は次の調整用に回し、調整後はまた別の未使用画像でテストする。
 
 ## 未確認のこと
 - 実画像での動作（テストは画面をスマホで撮った写真で実施）
