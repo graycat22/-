@@ -127,6 +127,11 @@ DEFAULT_PARAMS = {
     "black_dark_ratio": 0.55,   # 線の中の暗い所（下位10%）が、プレートの明るさのこの割合以下なら本物の黒い線
     "black_rim_tol": 30,        # 線の上端のまわりこの距離以内（中心寄り）に白い縁取りがあれば「縁に届いた」 [px]
     "black_rim_bright": 0.5,    # 縁取りの白さの目安: プレートの明るさと、U字のまわりの上位1%の明るさの間のこの位置
+    "black_follow_len": 120,    # 線の上の端から縁取りまで、暗い所をたどる最大の長さ [px]
+    "black_follow_ratio": 0.80, # たどるとき「暗い」とみなす明るさ（プレートの明るさのこの割合以下）
+    "black_follow_side": 4,     # たどるとき、横に何 px まで暗い所を探すか
+    "black_follow_contrast": 15,  # まわりよりこれだけ暗ければ、割れの続きとみなす
+    "black_follow_gap": 12,     # 暗くない所がこれ以上続いたら、つながっていないとみなす [px]
     "black_min_radial": 0.2,    # 線が中心から外へ向かって radius のこの割合以上伸びていること（縁に沿う影を除く）
     "black_outer_bottom": True,   # True なら ROI の下端も「外縁」に数える（黒ワレは左右のリブで終わるので既定は False）
     "black_edge_tol": 12,       # ROI の左右の端・下端からこの距離以内に届いていれば「外縁に届いた」
@@ -381,6 +386,48 @@ class BaseCrackInspector:
         big[1:] = np.maximum(bstats[1:, cv2.CC_STAT_WIDTH], bstats[1:, cv2.CC_STAT_HEIGHT]) >= 0.6 * radius
         rim_band = big[blab]
 
+        def follow_to_rim(comp):
+            """割れの根元（縁取りの近く）は細く薄くて途切れやすい。線の上の端から、線の向きに沿って
+            中心の方へ暗い所をたどり、白い縁取りの帯まで暗いままつながっていれば True。"""
+            ys, xs = np.nonzero(comp)
+            d = dist_center[ys, xs]
+            top = d <= np.percentile(d, 30)                     # 線の中心寄り 3割の点で向きを測る
+            if top.sum() < 5:
+                return False
+            pts = np.c_[xs[top], ys[top]].astype(np.float32)
+            vx, vy, x0_, y0_ = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).ravel()
+            i0 = int(np.argmin(d))
+            x, y = float(xs[i0]), float(ys[i0])
+            if vx * (cxl - x) + vy * (cy_l - y) < 0:            # 中心の方へ向ける
+                vx, vy = -vx, -vy
+            dark_th = p["black_follow_ratio"] * plate
+            miss = 0
+            for _ in range(p["black_follow_len"]):
+                x, y = x + vx, y + vy
+                # 進む向きに垂直に ±follow_side px 探し、一番暗い所に寄せる（曲がった割れにも沿う）
+                best_v, best_xy = 1e9, (x, y)
+                for t in range(-p["black_follow_side"], p["black_follow_side"] + 1):
+                    qx, qy = int(round(x - t * vy)), int(round(y + t * vx))
+                    if 0 <= qx < w and 0 <= qy < h and ary_interest[qy, qx] < best_v:
+                        best_v, best_xy = float(ary_interest[qy, qx]), (qx, qy)
+                qx, qy = int(round(best_xy[0])), int(round(best_xy[1]))
+                if not (0 <= qx < w and 0 <= qy < h):
+                    return False
+                if rim_band[qy, qx] or (0 <= int(y) < h and 0 <= int(x) < w and rim_band[int(y), int(x)]):
+                    return True                                  # 暗い線のまま縁取りの帯に着いた
+                # まわり（横に ±follow_side*3 px）の明るさと比べて暗いか。根元は全体に明るく写ることがあるので相対で見る
+                side = [ary_interest[int(round(y + t * vx)) % h, int(round(x - t * vy)) % w]
+                        for t in range(-3 * p["black_follow_side"], 3 * p["black_follow_side"] + 1)]
+                local = float(np.median(side))
+                if best_v <= dark_th or best_v <= local - p["black_follow_contrast"]:
+                    x, y = float(qx), float(qy)
+                    miss = 0
+                else:
+                    miss += 1
+                    if miss > p["black_follow_gap"]:
+                        return False
+            return False
+
         def touches_rim(comp):
             ys, xs = np.nonzero(comp)
 
@@ -435,7 +482,7 @@ class BaseCrackInspector:
             ys_, xs_ = np.nonzero(comp)
             gate_line = np.mean(np.abs(xs_ - cxl) < p["black_gate_half"] * 2) > 0.5   # 大部分がゲートの真下（成形線）
             if (near_outer[comp].any() and radial >= p["black_min_radial"] * radius
-                    and not gate_line and touches_rim(comp)):
+                    and not gate_line and (touches_rim(comp) or follow_to_rim(comp))):
                 crossing += cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL,
                                              cv2.CHAIN_APPROX_SIMPLE)[-2]
 
