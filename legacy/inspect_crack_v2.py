@@ -674,6 +674,10 @@ class BaseCrackInspector:
         # 追加: 黒ワレは、広げた割れ全体の領域をピンクで描く
         if black_result is not None:
             ox, oy = black_result["offset"]
+            # 黒ワレを探した範囲（黒用の ROI）を水色で描く。赤／緑の枠は明るいワレ用
+            area = cv2.findContours((black_result["mask"] > 0).astype(np.uint8),
+                                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+            cv2.drawContours(out_frame, area, -1, (255, 255, 0), 2, offset=(ox, oy))
             for contour in black_result["region_contours"]:
                 contour_shifted = contour.copy()
                 contour_shifted[:, 0, 0] += ox
