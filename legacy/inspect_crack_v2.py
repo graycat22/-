@@ -136,7 +136,8 @@ DEFAULT_PARAMS = {
     "black_follow_side": 4,     # たどるとき、横に何 px まで暗い所を探すか
     "black_follow_contrast": 15,  # まわりよりこれだけ暗ければ、割れの続きとみなす
     "black_follow_gap": 12,     # 暗くない所がこれ以上続いたら、つながっていないとみなす [px]
-    "black_min_radial": 0.2,    # 線が中心から外へ向かって radius のこの割合以上伸びていること（縁に沿う影を除く）
+    "black_min_radial": 0.5,    # 線が中心から外へ向かって radius のこの割合以上伸びていること（縁に沿う暗い輪郭を除く）
+    "black_vline_width": 25,    # 左右のぶれがこれ未満のまっすぐ縦の線は、リブの縁の線として除く [px]
     "black_outer_bottom": True,   # True なら ROI の下端も「外縁」に数える（黒ワレは左右のリブで終わるので既定は False）
     "black_edge_tol": 12,       # ROI の左右の端・下端からこの距離以内に届いていれば「外縁に届いた」
 }
@@ -359,9 +360,8 @@ class BaseCrackInspector:
 
         # 探す範囲: U字の外側の帯（元と同じ円の帯）。中央はゲートの所だけ除く
         mask = np.full_like(ary_interest, 255)                # プレート全体（元は半径 1.75R の円の中だけ）
-        # 内側の円は radius より少し小さくする（pos2 などで U字が円より小さいと、割れの根元が円の中に隠れるため）。
-        # U字の開口部の中を拾わないことは、あとの「縁取りに届いているか」の判定で保証する
-        cv2.circle(mask, (cxl, cy_l), int(radius * p["black_inner_ratio"]), 0, -1)
+        # U字の形は写真ごとのブレが大きく当てられないので、開口部を切り抜くことはしない（長方形のまま）。
+        # 開口部の中の暗い線は白い縁取りを越えて外縁まで届かないので、あとの「縁から外縁まで」の判定で落ちる
         mask[:int(radius * p["black_top_cut"])] = 0         # U字の脚の上の方まで見る（元は radius/2 より上を捨てていた）
         em = p["black_edge_margin"]                          # カセットの左右の端（縦リブの黒い線）は割れではないので除く
         mask[:, :em] = 0
@@ -465,17 +465,22 @@ class BaseCrackInspector:
             # 縁は U字のまわり（ROI の上端 = U字の底より上）にある。それより下の刻印の白い所を縁と間違えない
             if ys.min() > y_top_l + p["black_rim_tol"]:
                 return False
-            i = int(np.argmin(dist_center[ys, xs]))
-            px, py = float(xs[i]), float(ys[i])
-            # 割れの所は縁取りが切れて暗いので、真っすぐ中心方向だけでなく、上端のまわり（半径 rim_tol）の
-            # 中心寄り半分に、白く光る縁取りが 15 画素以上あれば「縁に届いた」とする
+            # 線の中心寄りの部分（中心からの距離が近い方 3割）の点を順に見て、どこかで
+            # まわり（半径 rim_tol）の中心寄り半分に、白く光る縁取りが 15 画素以上あれば「縁に届いた」とする。
+            # 探す範囲を長方形にしたので、線の上の端が縁より先（開口部側）まで伸びていることがあり、端の 1点だけでは見ない
+            d = dist_center[ys, xs]
+            idx = np.nonzero(d <= np.percentile(d, 30))[0]
             r = p["black_rim_tol"]
-            x0, x1 = int(max(0, px - r)), int(min(w, px + r + 1))
-            y0_, y1_ = int(max(0, py - r)), int(min(h, py + r + 1))
-            gy, gx = np.mgrid[y0_:y1_, x0:x1]
-            disc = np.hypot(gx - px, gy - py) <= r
-            inward = dist_center[y0_:y1_, x0:x1] <= dist_center[int(py), int(px)] + 3
-            return int((rim_band[y0_:y1_, x0:x1] & disc & inward).sum()) >= 15
+            for i in idx[::max(1, len(idx) // 20)]:
+                px, py = float(xs[i]), float(ys[i])
+                x0, x1 = int(max(0, px - r)), int(min(w, px + r + 1))
+                y0_, y1_ = int(max(0, py - r)), int(min(h, py + r + 1))
+                gy, gx = np.mgrid[y0_:y1_, x0:x1]
+                disc = np.hypot(gx - px, gy - py) <= r
+                inward = dist_center[y0_:y1_, x0:x1] <= dist_center[int(py), int(px)] + 3
+                if int((rim_band[y0_:y1_, x0:x1] & disc & inward).sum()) >= 15:
+                    return True
+            return False
 
         e = p["black_edge_tol"]
         near_outer = np.zeros((h, w), bool)
@@ -521,6 +526,9 @@ class BaseCrackInspector:
             if (np.mean(edge_d < p["black_groove_dist"]) > 0.6
                     and (xs_.max() - xs_.min()) < p["black_groove_width"]):
                 continue
+            # まっすぐ縦に走る細い線（リブの縁の線）は割れではない。本物の割れは縦長でも左右に 30px 以上ぶれる
+            if (xs_.max() - xs_.min()) < p["black_vline_width"]:
+                continue
             if (near_outer[comp].any() and radial >= p["black_min_radial"] * radius
                     and not gate_line and (touches_rim(comp) or follow_to_rim(comp))):
                 crossing += cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL,
@@ -543,6 +551,7 @@ class BaseCrackInspector:
             "region_contours": crossing,           # 描画用（NG の線だけ描く）
             "region_height": region_height,
             "offset": (left_lim, y0),
+            "area": (em, int(radius * p["black_top_cut"]), w - em, h),   # 黒ワレを探した長方形（切り出し画像の座標）
         }
 
     def inspect(self, frame, out_frame=None, force=False):
@@ -675,9 +684,8 @@ class BaseCrackInspector:
         if black_result is not None:
             ox, oy = black_result["offset"]
             # 黒ワレを探した範囲（黒用の ROI）を水色で描く。赤／緑の枠は明るいワレ用
-            area = cv2.findContours((black_result["mask"] > 0).astype(np.uint8),
-                                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
-            cv2.drawContours(out_frame, area, -1, (255, 255, 0), 2, offset=(ox, oy))
+            bx0, by0, bx1, by1 = black_result["area"]
+            cv2.rectangle(out_frame, (ox + bx0, oy + by0), (ox + bx1 - 1, oy + by1 - 1), (255, 255, 0), 2)
             for contour in black_result["region_contours"]:
                 contour_shifted = contour.copy()
                 contour_shifted[:, 0, 0] += ox
