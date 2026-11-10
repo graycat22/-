@@ -10,10 +10,6 @@ import cv2
 import numpy as np
 from loguru import logger
 
-# v2: 黒ワレ・明ワレの判定に「割れの定義（U字の内側から外縁まで抜けている）」を使う（black_crack_v2.py）
-from black_crack_v2 import (BLACK_V2_PARAMS, BRIGHT_V2_PARAMS, find_bright_crossing,
-                            find_crossing_cracks, make_search_mask)
-
 def getker(num):
     """元コードのgetker()相当"""
     num_h = num // 2
@@ -27,6 +23,134 @@ def _contour_mean(ary, contour):
     mask = np.zeros_like(ary)
     cv2.drawContours(mask, [contour], -1, 255, -1)
     return float(ary[mask > 0].mean())
+
+
+# ---- v2 追加: 割れの定義「U字の縁から外縁まで抜けている」で判定するための関数 ----
+def _long_bright_lines(ary, th, min_len):
+    """周りより th 以上明るい細い線のうち、min_len px 以上続くもの（= U字の縁取り）"""
+    tophat = cv2.morphologyEx(ary, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    bright = cv2.morphologyEx((tophat > th).astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bright)
+    keep = np.zeros(n, bool)
+    keep[1:] = np.maximum(st[1:, cv2.CC_STAT_WIDTH], st[1:, cv2.CC_STAT_HEIGHT]) >= min_len
+    return keep[lab]
+
+
+def _link_to_rim(comp, ary, d_out, rim, plate):
+    """線の内側の端から縁取りまでつながっていれば、その道筋 [(x, y), ...] を返す。だめなら None"""
+    h, w = comp.shape
+    ys, xs = np.nonzero(comp)
+    d = d_out[ys, xs]
+    inner = d >= np.percentile(d, 70)                     # 外縁から遠い 3割 = 内側の端
+    if inner.sum() < 5:
+        return None
+    # (1) 内側の端から、線の向きに暗い所をたどって縁取りまで行けるか（割れの根元は薄く途切れやすい）
+    vx, vy, _, _ = cv2.fitLine(np.c_[xs[inner], ys[inner]].astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).ravel()
+    x, y = float(xs[np.argmax(d)]), float(ys[np.argmax(d)])
+    qx, qy = int(np.clip(round(x + 10 * vx), 0, w - 1)), int(np.clip(round(y + 10 * vy), 0, h - 1))
+    if d_out[qy, qx] < d_out[int(y), int(x)]:             # 外縁から離れる向きにする
+        vx, vy = -vx, -vy
+    route, miss = [(int(x), int(y))], 0
+    for _ in range(200):
+        x, y = x + vx, y + vy
+        cand = [(int(round(x - t * vy)), int(round(y + t * vx))) for t in range(-4, 5)]
+        cand = [(cx_, cy_) for cx_, cy_ in cand if 0 <= cx_ < w and 0 <= cy_ < h]
+        if not cand:
+            break
+        bx, by = min(cand, key=lambda q: ary[q[1], q[0]])   # 横 ±4px で一番暗い所に寄せる
+        route.append((bx, by))
+        if rim[by, bx] or (0 <= int(y) < h and 0 <= int(x) < w and rim[int(y), int(x)]):
+            return route
+        side = [ary[int(round(y + t * vx)) % h, int(round(x - t * vy)) % w] for t in range(-12, 13)]
+        if ary[by, bx] <= 0.8 * plate or ary[by, bx] <= np.median(side) - 15:   # 周りより暗い = 割れの続き
+            x, y, miss = float(bx), float(by), 0
+        else:
+            miss += 1
+            if miss > 12:
+                break
+    # (2) たどれなくても、内側の端のまわり 30px に縁取りがあれば届いている
+    for i in np.nonzero(inner)[0][::max(1, inner.sum() // 20)]:
+        px, py = int(xs[i]), int(ys[i])
+        y0, x0 = max(0, py - 30), max(0, px - 30)
+        sub = rim[y0:py + 31, x0:px + 31]
+        gy, gx = np.nonzero(sub)
+        dist = np.hypot(gx + x0 - px, gy + y0 - py)
+        if (dist <= 30).sum() >= 15:
+            j = int(np.argmin(dist))
+            return [(px, py), (int(gx[j] + x0), int(gy[j] + y0))]
+    return None
+
+
+def _find_black_crossing(ary, binary, mask, roi_lr, top_row, p):
+    """黒い線のまとまりのうち、縁取りから外縁まで抜けているものの輪郭を返す"""
+    h, w = ary.shape
+    binary = ((binary > 0) & (mask > 0)).astype(np.uint8)
+    # 縦リブの内側の溝: 端の近くで、上から下まで同じ列に続く暗い線は消す
+    col = cv2.dilate(binary, np.ones((1, 7), np.uint8))[top_row:].mean(axis=0)
+    gd = p["black_groove_dist"]
+    groove = (col > 0.5) & ((np.arange(w) < gd) | (np.arange(w) >= w - gd))
+    groove = cv2.dilate(groove.astype(np.uint8)[None], np.ones((1, 25), np.uint8))[0] > 0
+    binary[:, groove] = 0
+    # 外縁 = 溝か赤い ROI の左右の辺（内側の方）と、下端
+    gl, gr = np.nonzero(groove[:w // 2])[0], w // 2 + np.nonzero(groove[w // 2:])[0]
+    in_l = max(15, gl.max() + 1 if len(gl) else 0, roi_lr[0])
+    in_r = min(w - 15, gr.min() if len(gr) else w, roi_lr[1])
+    outer = np.zeros((h, w), bool)
+    outer[:, :in_l + 12] = outer[:, in_r - 12:] = outer[h - 12:] = True
+    d_out = cv2.distanceTransform((~outer).astype(np.uint8), cv2.DIST_L2, 5)
+
+    plate = float(np.median(ary[mask > 0]))
+    rim = _long_bright_lines(ary, p["black_rim_tophat"], p["black_rim_len"])        # はっきりした縁取り
+    rim_soft = _long_bright_lines(ary, p["black_rim_tophat"] - 10, p["black_rim_len"])   # 弱いものも含む
+    near_rim = cv2.dilate(rim_soft.astype(np.uint8), getker(31)) > 0
+    d_rim = cv2.distanceTransform((cv2.morphologyEx(rim_soft.astype(np.uint8), cv2.MORPH_CLOSE, getker(31)) == 0)
+                                  .astype(np.uint8), cv2.DIST_L2, 5)
+
+    # 小さい点は捨てる。縁取りの 15px 以内は使わない（縁に沿う暗い輪郭を割れと間違えないため）
+    n, lab, st, _ = cv2.connectedComponentsWithStats(binary)
+    keep = (lab > 0) & (st[lab, cv2.CC_STAT_AREA] >= 30) & ~near_rim
+    strong = keep & (np.bincount(lab[keep], minlength=n)[lab] >= 30)
+    # 近い線（25px 以内）を 1つの割れとしてまとめて、1つずつ調べる
+    _, grp = cv2.connectedComponents(cv2.dilate(strong.astype(np.uint8), getker(25)))
+    crossing = []
+    for gi in range(1, grp.max() + 1):
+        comp = (grp == gi) & strong
+        ys, xs = np.nonzero(comp)
+        if len(xs) < 30 or np.ptp(xs) < 25:              # 小さい / まっすぐ縦の線（リブの縁）
+            continue
+        far = comp & (d_rim > 30)                        # 縁取りから離れた部分
+        fy, fx = np.nonzero(far)
+        if len(fx) < 30 or np.hypot(np.ptp(fx), np.ptp(fy)) < 100 or not outer[far].any():
+            continue                                     # 縁に沿っているだけ / 外縁に届かない
+        ev = np.sort(np.linalg.eigvalsh(np.cov(np.c_[xs, ys].T.astype(float))))
+        cs, hier = cv2.findContours(comp.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)[-2:]
+        holes = sum(cv2.contourArea(c) for c, hh in zip(cs, hier[0]) if hh[3] >= 0)
+        if ev[0] > 0.36 * ev[1] or holes > 0.1 * len(xs):  # 細長くない / 穴がある = 刻印・ロゴ
+            continue
+        route = _link_to_rim(comp, ary, d_out, rim, plate)
+        if route:
+            region = comp.astype(np.uint8)
+            cv2.polylines(region, [np.array(route, np.int32)], False, 1, 5)   # 縁取りまでつないで描く
+            crossing += cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    return crossing
+
+
+def _find_bright_crossing(ary, closed, p):
+    """光が漏れて白く光る割れ目が、ROI の上端から下端まで続いていればその輪郭を返す"""
+    h = ary.shape[0]
+    med = float(np.median(ary))
+    white = closed >= med + 0.65 * (np.percentile(ary, 99) - med)
+    white &= ~cv2.dilate(_long_bright_lines(ary, p["black_rim_tophat"], p["black_rim_len"]).astype(np.uint8),
+                         np.ones((7, 7), np.uint8)).astype(bool)    # U字の縁取りは除く
+    white = cv2.morphologyEx(white.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(white)
+    found = []
+    for i in range(1, n):
+        top, hgt = st[i, cv2.CC_STAT_TOP], st[i, cv2.CC_STAT_HEIGHT]
+        widths = (lab == i).sum(axis=1)
+        if top <= 30 and top + hgt >= h - 30 and np.median(widths[widths > 0]) >= p["bright_min_width"]:
+            found += cv2.findContours((lab == i).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    return found                                         # 幅が細いもの = 白い擦り傷は除く
 
 
 BLACKHAT_KERNELS = [
@@ -58,9 +182,12 @@ DEFAULT_PARAMS = {
     "th_bright_mean": 135,
     "th_black_level": 18,
     "template_threshold": 0.0,
+    # v2 追加
+    "black_groove_dist": 60,   # 端からこの距離以内の縦の暗い線は溝として消す [px]
+    "black_rim_tophat": 25,    # 周りよりこれだけ明るい細い線を縁取りとする
+    "black_rim_len": 200,      # 縁取りとみなす白い線の長さ [px]
+    "bright_min_width": 25,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
 }
-DEFAULT_PARAMS.update(BLACK_V2_PARAMS)   # v2: 黒ワレ判定の設定を追加（pos2 も引き継ぐ）
-DEFAULT_PARAMS.update(BRIGHT_V2_PARAMS)  # v2: 明ワレ判定の設定を追加
 
 # pos2 は params_cm.json の camera_params["2"] 相当
 POS2_PARAMS = dict(
@@ -244,8 +371,7 @@ class BaseCrackInspector:
             score = max(score, contour_height)
             selected_contours.append(contour)
 
-        # v2: 白く光る割れ目が ROI の上端から下端まで続いていれば、元の判定に関係なく NG
-        crossing = find_bright_crossing(ary_interest, closed, p)
+        crossing = _find_bright_crossing(ary_interest, closed, p)   # v2: 上端から下端まで白い割れ目
         selected_contours += crossing
 
         return {
@@ -267,7 +393,7 @@ class BaseCrackInspector:
         radius,
     ):
         p = self.params
-        # v2: 赤い ROI の中だけでなく、カセットの左右の端から端までを探す
+        # v2: 赤い ROI ではなく、カセットの左右の端から端までを見る
         y0 = max(0, top_lim - radius)
         cst_left, cst_right, _ = self._find_cassette_limits(ary_gray)
         ary_interest = ary_gray[
@@ -277,8 +403,12 @@ class BaseCrackInspector:
         if ary_interest.size == 0:
             raise RuntimeError("黒ワレ検出用ROIが空です")
 
-        # v2: 探す範囲は長方形（U字の形は写真ごとのブレが大きく当てられないので使わない）
-        mask = make_search_mask(ary_interest.shape, radius, cx - cst_left, top_lim - y0, p)
+        # v2: 範囲は長方形（U字の円は使わない）。上の方・左右の端・ゲートの下だけ除く
+        mask = np.full_like(ary_interest, 255)
+        mask[:radius // 5] = 0
+        mask[:, :15] = mask[:, -15:] = 0
+        gx = cx - cst_left
+        mask[top_lim - y0 - 20:, max(0, gx - 40):gx + 40] = 0
 
         th_clip = int(np.percentile(
             ary_gray[top_lim:bottom_lim, left_lim:right_lim],
@@ -286,8 +416,7 @@ class BaseCrackInspector:
         ))
         clipped = ary_interest.clip(0, th_clip)
 
-        # v2: CLOSE(11) は幅 11px 未満の細い割れ線を埋めて消すので、軽いぼかしだけにする
-        closed = cv2.GaussianBlur(clipped, (3, 3), 0)
+        closed = cv2.GaussianBlur(clipped, (3, 3), 0)   # v2: CLOSE(11) は細い割れを消すのでやめた
         # 横長に加えて、縦・斜めの黒い割れも拾う(inspect_cm.py と同じ)
         blackhat = np.max([
             cv2.morphologyEx(
@@ -320,17 +449,11 @@ class BaseCrackInspector:
         score_black = 0 if not heights else int(np.max(heights))
         logger.info(f"score_black:{score_black}, th:{p['th_score_black']}")
 
-        # v2: 判定は「黒い線が縁取りから外縁まで抜けているか」（score_black は参考値として残す）
-        crossing = find_crossing_cracks(
-            ary_interest,
-            binary,
-            mask,
-            (left_lim - cst_left, right_lim - cst_left),
-            cx - cst_left,
-            int(radius * p["black_top_cut"]),
-            p,
+        # v2: 判定は score_black ではなく「縁から外縁まで抜けた黒い線があるか」
+        crossing = _find_black_crossing(
+            ary_interest, binary, mask,
+            (left_lim - cst_left, right_lim - cst_left), radius // 5, p,
         )
-        logger.info(f"black crossing:{len(crossing)}")
 
         return {
             "score_black": score_black,
@@ -339,8 +462,8 @@ class BaseCrackInspector:
             "binary": binary,
             "mask": mask,
             "contours": contours,
-            "crossing_contours": crossing,      # v2: NG の理由になった線（切り出し画像の座標）
-            "offset": (cst_left, y0),           # v2: 切り出し画像 -> 元画像 の座標のずれ
+            "crossing": crossing,           # v2: 描画用
+            "offset": (cst_left, y0),       # v2: 描画用
         }
 
     def inspect(self, frame, out_frame=None, force=False):
@@ -467,12 +590,11 @@ class BaseCrackInspector:
                 2,
             )
 
-        # v2: 黒ワレを探した範囲を水色、割れと判定した線をピンクで描く
-        if black_result is not None:
+        if black_result is not None:   # v2: 黒ワレの範囲を水色、割れをピンクで描く
             ox, oy = black_result["offset"]
             ys, xs = np.nonzero(black_result["mask"])
             cv2.rectangle(out_frame, (ox + xs.min(), oy + ys.min()), (ox + xs.max(), oy + ys.max()), (255, 255, 0), 2)
-            cv2.drawContours(out_frame, black_result["crossing_contours"], -1, (255, 0, 255), 2, offset=(ox, oy))
+            cv2.drawContours(out_frame, black_result["crossing"], -1, (255, 0, 255), 2, offset=(ox, oy))
 
 
 class InspectorCrackPos1(BaseCrackInspector):
