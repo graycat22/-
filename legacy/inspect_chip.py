@@ -27,13 +27,24 @@ def _contour_mean(ary, contour):
 
 
 def _find_chip(ary):
-    """欠け: ROI の下端からつながっている、プレートより明るい所（= 欠けて背景が見えている所）"""
+    """追加: 欠けの領域を返す（1 = 欠け、0 = それ以外）。ary は赤い ROI のグレー画像。
+
+    考え方: 下が欠けると、プレート（黒い樹脂）があるはずの所から背景（明るい）が見える。
+    そこで「プレートより明るく」かつ「ROI の下端からつながっている」所を欠けとする。
+    刻印や傷の白い所は下端につながっていないので数えない。
+    """
+    # 1. 細かいざらつきで白黒が乱れないよう、7x7 で軽くぼかす
     a = cv2.blur(ary, (7, 7))
-    ref = float(np.median(a[:a.shape[0] // 3]))          # プレートの明るさ（ROI の上 1/3）
+    # 2. プレートの明るさの基準 = ROI の上 1/3 の中央値（欠けは下側にできるので、上側は正常なプレート）
+    ref = float(np.median(a[:a.shape[0] // 3]))
+    # 3. 二値化: プレートの明るさと ROI で一番明るい所（上位 1%）の中間より明るければ「プレートではない」
     bright = (a >= ref + 0.5 * (float(np.percentile(a, 99)) - ref)).astype(np.uint8)
+    # 4. 5x5 より小さい白い点（ノイズ・小さな反射）は消す
     bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    # 5. 白い所を塊ごとに番号付けし、ROI の一番下の行に触れている塊だけを残す
     _, lab = cv2.connectedComponents(bright)
-    return np.isin(lab, np.unique(lab[-1])[1:]).astype(np.uint8)   # 下端の行に触れているもの
+    bottom_ids = np.unique(lab[-1])[1:]                   # 一番下の行に出てくる塊の番号（0 = 背景は除く）
+    return np.isin(lab, bottom_ids).astype(np.uint8)
 
 
 BLACKHAT_KERNELS = [
@@ -65,7 +76,7 @@ DEFAULT_PARAMS = {
     "th_bright_mean": 135,
     "th_black_level": 18,
     "template_threshold": 0.0,
-    "th_chip": 0.03,   # 追加: 欠け（下端からつながる明るい所）が ROI のこの割合を超えたら NG
+    "th_chip": 0.03,   # 追加: 欠けの面積が赤い ROI の 3% を超えたら NG（OK 品は 1% 以下）
 }
 
 # pos2 は params_cm.json の camera_params["2"] 相当
@@ -383,10 +394,12 @@ class BaseCrackInspector:
         )
 
         # 追加: 下が大きく欠けていないか
+        # 赤い ROI（U字の下のプレート部分）を切り出して欠けの領域を求める
         chip = _find_chip(ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]])
+        # 欠けの面積 = 欠けの画素数 ÷ ROI の画素数（chip は 0/1 なので平均がそのまま割合）
         chip_ng = chip.mean() > self.params["th_chip"]
 
-        is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng
+        is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng   # 変更: 欠けも NG に含める
         info = {
             "judge": "NG" if is_ng else "OK",
             "is_ng": bool(is_ng),
@@ -426,7 +439,7 @@ class BaseCrackInspector:
                 max_loc,
                 is_ng,
             )
-            if chip_ng:   # 追加: 欠けをオレンジで描く
+            if chip_ng:   # 追加: 欠けの輪郭をオレンジで描く（ROI の座標なので ROI の左上の分ずらす）
                 cs = cv2.findContours(chip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
                 cv2.drawContours(out_frame, cs, -1, (0, 165, 255), 3, offset=(roi["left_lim"], roi["top_lim"]))
 
