@@ -1,5 +1,5 @@
 --- inspect_crack_orig.py	2026-11-09 06:58:29.752606367 +0000
-+++ inspect_crack_v2.py	2026-11-10 02:24:22.657109205 +0000
++++ inspect_crack_v2.py	2026-11-10 02:50:57.372814709 +0000
 @@ -1,6 +1,5 @@
  #!/usr/bin/env python3
  # -*- coding: utf-8 -*-
@@ -132,7 +132,7 @@
 +
 +
 +def _find_bright_crossing(ary, closed, p):
-+    """光が漏れて白く光る割れ目が、ROI の上端から下端まで続いていればその輪郭を返す"""
++    """光が漏れて白く光る割れ目（下端まで届き、ROI の高さの 6割以上ある白い所）の輪郭を返す"""
 +    h = ary.shape[0]
 +    med = float(np.median(ary))
 +    white = closed >= med + 0.65 * (np.percentile(ary, 99) - med)
@@ -144,7 +144,7 @@
 +    for i in range(1, n):
 +        top, hgt = st[i, cv2.CC_STAT_TOP], st[i, cv2.CC_STAT_HEIGHT]
 +        widths = (lab == i).sum(axis=1)
-+        if top <= 30 and top + hgt >= h - 30 and np.median(widths[widths > 0]) >= p["bright_min_width"]:
++        if top + hgt >= h - 20 and hgt >= 0.6 * h and np.median(widths[widths > 0]) >= p["bright_min_width"]:
 +            found += cv2.findContours((lab == i).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
 +    return found                                         # 幅が細いもの = 白い擦り傷は除く
 +
@@ -160,26 +160,78 @@
 +    "black_groove_dist": 60,   # 端からこの距離以内の縦の暗い線は溝として消す [px]
 +    "black_rim_tophat": 25,    # 周りよりこれだけ明るい細い線を縁取りとする
 +    "black_rim_len": 200,      # 縁取りとみなす白い線の長さ [px]
-+    "bright_min_width": 25,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
++    "bright_min_width": 15,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
 +    "th_chip": 0.03,           # 欠け: 下端からつながる明るい所が ROI のこの割合を超えたら NG
  }
  
  # pos2 は params_cm.json の camera_params["2"] 相当
-@@ -239,9 +382,12 @@
-             score = max(score, contour_height)
-             selected_contours.append(contour)
+@@ -192,59 +335,14 @@
+             cv2.MORPH_CLOSE,
+             getker(11),
+         )
+-        canny = cv2.Canny(
+-            closed,
+-            p["canny1"],
+-            p["canny2"],
+-            apertureSize=7,
+-        )
+-        dilated = cv2.dilate(canny, getker(3))
+-
+-        contours = cv2.findContours(dilated, 0, 2)[-2]
+-
+-        score = 0
+-        selected_contours = []
+-        for contour in contours:
+-            if contour[:, 0, 1].min() > 10:
+-                continue
+-
+-            vx, vy, x, y = cv2.fitLine(
+-                contour,
+-                cv2.DIST_L2,
+-                0,
+-                0.01,
+-                0.01,
+-            )
+-            dist = np.abs(
+-                vx * (-radius - y)
+-                - vy * (cx - left_lim - x)
+-            )[0]
+-
+-            if dist > radius * 1.1:
+-                dist = -cv2.pointPolygonTest(
+-                    contour,
+-                    (int(cx - left_lim), int(-radius)),
+-                    True,
+-                )
+-                if dist > radius * 1.15:
+-                    continue
+-
+-            # 擦り傷はグレー、本物の明るいワレは光が透けて白飛びする
+-            if _contour_mean(ary_interest, contour) < p["th_bright_mean"]:
+-                continue
+-
+-            contour_height = (
+-                contour[:, 0, 1].max() - contour[:, 0, 1].min()
+-            )
+-            score = max(score, contour_height)
+-            selected_contours.append(contour)
++        # v2: U字の円は使わない。白く光る割れ目（光が漏れている所）が下端まで届いていれば NG
++        contours = _find_bright_crossing(ary_interest, closed, p)
++        score = max([int(np.ptp(c[:, 0, 1])) for c in contours], default=0)
  
-+        crossing = _find_bright_crossing(ary_interest, closed, p)   # v2: 上端から下端まで白い割れ目
-+        selected_contours += crossing
-+
          return {
-             "score": int(score),
+-            "score": int(score),
 -            "is_ng": score > p["th_score"],
-+            "is_ng": score > p["th_score"] or len(crossing) > 0,
-             "canny": canny,
-             "dilated": dilated,
-             "contours": selected_contours,
-@@ -258,30 +404,22 @@
+-            "canny": canny,
+-            "dilated": dilated,
+-            "contours": selected_contours,
++            "score": score,
++            "is_ng": len(contours) > 0,
++            "contours": contours,
+         }
+ 
+     def _detect_black_crack(
+@@ -258,30 +356,22 @@
          radius,
      ):
          p = self.params
@@ -221,7 +273,7 @@
  
          th_clip = int(np.percentile(
              ary_gray[top_lim:bottom_lim, left_lim:right_lim],
-@@ -289,11 +427,7 @@
+@@ -289,11 +379,7 @@
          ))
          clipped = ary_interest.clip(0, th_clip)
  
@@ -234,7 +286,7 @@
          # 横長に加えて、縦・斜めの黒い割れも拾う(inspect_cm.py と同じ)
          blackhat = np.max([
              cv2.morphologyEx(
-@@ -326,13 +460,25 @@
+@@ -326,13 +412,25 @@
          score_black = 0 if not heights else int(np.max(heights))
          logger.info(f"score_black:{score_black}, th:{p['th_score_black']}")
  
@@ -261,7 +313,7 @@
          }
  
      def inspect(self, frame, out_frame=None, force=False):
-@@ -371,12 +517,16 @@
+@@ -371,12 +469,16 @@
              roi["radius"],
          )
  
@@ -279,7 +331,7 @@
              "template_score": float(template_score),
              "template_location": [int(max_loc[0]), int(max_loc[1])],
              "template_location_relative": [
-@@ -409,6 +559,7 @@
+@@ -409,6 +511,7 @@
                  bright_result,
                  max_loc,
                  is_ng,
@@ -287,7 +339,7 @@
              )
  
          return info
-@@ -421,6 +572,7 @@
+@@ -421,6 +524,7 @@
          bright_result,
          max_loc,
          is_ng,
@@ -295,7 +347,7 @@
      ):
          out_frame[:] = frame
          left = roi["left_lim"]
-@@ -457,6 +609,15 @@
+@@ -457,6 +561,15 @@
                  2,
              )
  

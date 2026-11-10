@@ -146,7 +146,7 @@ def _find_chip(ary):
 
 
 def _find_bright_crossing(ary, closed, p):
-    """光が漏れて白く光る割れ目が、ROI の上端から下端まで続いていればその輪郭を返す"""
+    """光が漏れて白く光る割れ目（下端まで届き、ROI の高さの 6割以上ある白い所）の輪郭を返す"""
     h = ary.shape[0]
     med = float(np.median(ary))
     white = closed >= med + 0.65 * (np.percentile(ary, 99) - med)
@@ -158,7 +158,7 @@ def _find_bright_crossing(ary, closed, p):
     for i in range(1, n):
         top, hgt = st[i, cv2.CC_STAT_TOP], st[i, cv2.CC_STAT_HEIGHT]
         widths = (lab == i).sum(axis=1)
-        if top <= 30 and top + hgt >= h - 30 and np.median(widths[widths > 0]) >= p["bright_min_width"]:
+        if top + hgt >= h - 20 and hgt >= 0.6 * h and np.median(widths[widths > 0]) >= p["bright_min_width"]:
             found += cv2.findContours((lab == i).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
     return found                                         # 幅が細いもの = 白い擦り傷は除く
 
@@ -196,7 +196,7 @@ DEFAULT_PARAMS = {
     "black_groove_dist": 60,   # 端からこの距離以内の縦の暗い線は溝として消す [px]
     "black_rim_tophat": 25,    # 周りよりこれだけ明るい細い線を縁取りとする
     "black_rim_len": 200,      # 縁取りとみなす白い線の長さ [px]
-    "bright_min_width": 25,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
+    "bright_min_width": 15,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
     "th_chip": 0.03,           # 欠け: 下端からつながる明るい所が ROI のこの割合を超えたら NG
 }
 
@@ -335,62 +335,14 @@ class BaseCrackInspector:
             cv2.MORPH_CLOSE,
             getker(11),
         )
-        canny = cv2.Canny(
-            closed,
-            p["canny1"],
-            p["canny2"],
-            apertureSize=7,
-        )
-        dilated = cv2.dilate(canny, getker(3))
-
-        contours = cv2.findContours(dilated, 0, 2)[-2]
-
-        score = 0
-        selected_contours = []
-        for contour in contours:
-            if contour[:, 0, 1].min() > 10:
-                continue
-
-            vx, vy, x, y = cv2.fitLine(
-                contour,
-                cv2.DIST_L2,
-                0,
-                0.01,
-                0.01,
-            )
-            dist = np.abs(
-                vx * (-radius - y)
-                - vy * (cx - left_lim - x)
-            )[0]
-
-            if dist > radius * 1.1:
-                dist = -cv2.pointPolygonTest(
-                    contour,
-                    (int(cx - left_lim), int(-radius)),
-                    True,
-                )
-                if dist > radius * 1.15:
-                    continue
-
-            # 擦り傷はグレー、本物の明るいワレは光が透けて白飛びする
-            if _contour_mean(ary_interest, contour) < p["th_bright_mean"]:
-                continue
-
-            contour_height = (
-                contour[:, 0, 1].max() - contour[:, 0, 1].min()
-            )
-            score = max(score, contour_height)
-            selected_contours.append(contour)
-
-        crossing = _find_bright_crossing(ary_interest, closed, p)   # v2: 上端から下端まで白い割れ目
-        selected_contours += crossing
+        # v2: U字の円は使わない。白く光る割れ目（光が漏れている所）が下端まで届いていれば NG
+        contours = _find_bright_crossing(ary_interest, closed, p)
+        score = max([int(np.ptp(c[:, 0, 1])) for c in contours], default=0)
 
         return {
-            "score": int(score),
-            "is_ng": score > p["th_score"] or len(crossing) > 0,
-            "canny": canny,
-            "dilated": dilated,
-            "contours": selected_contours,
+            "score": score,
+            "is_ng": len(contours) > 0,
+            "contours": contours,
         }
 
     def _detect_black_crack(
