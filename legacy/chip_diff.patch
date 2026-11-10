@@ -1,0 +1,64 @@
+--- inspect_crack_orig.py	2026-11-09 06:58:29.752606367 +0000
++++ inspect_chip.py	2026-11-10 06:33:11.481495587 +0000
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-# ユーザーから受け取った元の検査スクリプト（比較用。変更しない）
++# 元の検査スクリプトに「欠け（下が大きく欠けている）」の判定だけを足したもの
+ 
+ import json
+ import os
+@@ -26,6 +26,16 @@
+     return float(ary[mask > 0].mean())
+ 
+ 
++def _find_chip(ary):
++    """欠け: ROI の下端からつながっている、プレートより明るい所（= 欠けて背景が見えている所）"""
++    a = cv2.blur(ary, (7, 7))
++    ref = float(np.median(a[:a.shape[0] // 3]))          # プレートの明るさ（ROI の上 1/3）
++    bright = (a >= ref + 0.5 * (float(np.percentile(a, 99)) - ref)).astype(np.uint8)
++    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
++    _, lab = cv2.connectedComponents(bright)
++    return np.isin(lab, np.unique(lab[-1])[1:]).astype(np.uint8)   # 下端の行に触れているもの
++
++
+ BLACKHAT_KERNELS = [
+     np.ones([1, 51], np.uint8),
+     np.ones([51, 1], np.uint8),
+@@ -55,6 +65,7 @@
+     "th_bright_mean": 135,
+     "th_black_level": 18,
+     "template_threshold": 0.0,
++    "th_chip": 0.03,   # 追加: 欠け（下端からつながる明るい所）が ROI のこの割合を超えたら NG
+ }
+ 
+ # pos2 は params_cm.json の camera_params["2"] 相当
+@@ -371,12 +382,17 @@
+             roi["radius"],
+         )
+ 
+-        is_ng = bright_result["is_ng"] or black_result["is_ng"]
++        # 追加: 下が大きく欠けていないか
++        chip = _find_chip(ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]])
++        chip_ng = chip.mean() > self.params["th_chip"]
++
++        is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng
+         info = {
+             "judge": "NG" if is_ng else "OK",
+             "is_ng": bool(is_ng),
+             "score": bright_result["score"],
+             "score_black": black_result["score_black"],
++            "chip_area": round(float(chip.mean()), 3),   # 追加: 欠けの面積（ROI に対する割合）
+             "template_score": float(template_score),
+             "template_location": [int(max_loc[0]), int(max_loc[1])],
+             "template_location_relative": [
+@@ -410,6 +426,9 @@
+                 max_loc,
+                 is_ng,
+             )
++            if chip_ng:   # 追加: 欠けをオレンジで描く
++                cs = cv2.findContours(chip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
++                cv2.drawContours(out_frame, cs, -1, (0, 165, 255), 3, offset=(roi["left_lim"], roi["top_lim"]))
+ 
+         return info
+ 
