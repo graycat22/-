@@ -17,6 +17,13 @@ U字の形（中心・半径・円）は使わない。写真ごとのブレが�
 import cv2
 import numpy as np
 
+# 明ワレ v2 の設定（DEFAULT_PARAMS に足して使う）
+BRIGHT_V2_PARAMS = {
+    "bright_rel": 0.65,           # 白い所: プレートの明るさ（中央値）と上位1%の明るさの間のこの位置より明るい
+    "bright_min_width": 25,       # 光が漏れる割れ目の幅の下限（中央値） [px]。白い擦り傷は細い（20px 以下）
+    "bright_edge_tol": 30,        # ROI の上端・下端からこの距離以内に届いていれば「端まで」 [px]
+}
+
 # 黒ワレ v2 の設定（DEFAULT_PARAMS に足して使う。pos1 / pos2 共通）
 BLACK_V2_PARAMS = {
     # 探す範囲
@@ -255,3 +262,31 @@ def find_crossing_cracks(ary, binary, mask, roi_lr, gate_x, top_row, p):
         if _touches_rim(comp, d_out, rim, p) or _follow_to_rim(comp, ary, d_out, rim, plate, p):
             crossing += cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
     return crossing
+
+
+def find_bright_crossing(ary, closed, p):
+    """明ワレ v2: 背面光が漏れて白く光る割れ目が、ROI の上端（U字の底）から下端まで続いていれば割れ。
+
+    元の明ワレ判定は輪郭が U字の円の中心を向いているかで見ていたため、U字の縁と一体に写った割れ目を落としていた。
+    ary    : 明ワレ用 ROI のグレー画像
+    closed : 元の前処理（明るい側にクリップ + CLOSE(11)）の結果
+    戻り値 : 割れと判定した白い所の輪郭のリスト（空なら OK）
+    """
+    h, w = ary.shape
+    med = float(np.median(ary))
+    th = med + p["bright_rel"] * (float(np.percentile(ary, 99)) - med)       # 写真ごとの明るさに合わせた「白」
+    rim, _ = find_rim(ary, p)                                                # U字の縁取りの白い線は除く
+    white = (closed >= th) & ~cv2.dilate(rim.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+    white = cv2.morphologyEx(white.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(white)
+    e = p["bright_edge_tol"]
+    found = []
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_TOP] > e or st[i, cv2.CC_STAT_TOP] + st[i, cv2.CC_STAT_HEIGHT] < h - e:
+            continue                                                         # 上端から下端まで届いていない
+        comp = lab == i
+        widths = comp.sum(axis=1)
+        if np.median(widths[widths > 0]) < p["bright_min_width"]:
+            continue                                                         # 細い = 白い擦り傷
+        found += cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    return found

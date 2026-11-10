@@ -11,7 +11,8 @@ import numpy as np
 from loguru import logger
 
 # v2: 黒ワレの判定を「割れの定義（U字の内側の縁取りから外縁まで抜けている）」に変えた（black_crack_v2.py）
-from black_crack_v2 import BLACK_V2_PARAMS, find_crossing_cracks, make_search_mask
+from black_crack_v2 import (BLACK_V2_PARAMS, BRIGHT_V2_PARAMS, find_bright_crossing,
+                            find_crossing_cracks, make_search_mask)
 
 def getker(num):
     """元コードのgetker()相当"""
@@ -59,6 +60,7 @@ DEFAULT_PARAMS = {
     "template_threshold": 0.0,
 }
 DEFAULT_PARAMS.update(BLACK_V2_PARAMS)   # v2: 黒ワレ判定の設定を追加（pos2 も引き継ぐ）
+DEFAULT_PARAMS.update(BRIGHT_V2_PARAMS)  # v2: 明ワレ判定の設定を追加
 
 # pos2 は params_cm.json の camera_params["2"] 相当
 POS2_PARAMS = dict(
@@ -242,9 +244,13 @@ class BaseCrackInspector:
             score = max(score, contour_height)
             selected_contours.append(contour)
 
+        # v2: 白く光る割れ目が ROI の上端から下端まで続いていれば、元の判定に関係なく NG
+        crossing = find_bright_crossing(ary_interest, closed, p)
+        selected_contours += crossing
+
         return {
             "score": int(score),
-            "is_ng": score > p["th_score"],
+            "is_ng": score > p["th_score"] or len(crossing) > 0,
             "canny": canny,
             "dilated": dilated,
             "contours": selected_contours,
