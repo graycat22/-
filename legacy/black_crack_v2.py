@@ -112,7 +112,8 @@ def find_rim(ary, p):
 
 
 def _touches_rim(comp, d_out, rim, p):
-    """線の内側の部分（外縁から遠い方 3割）のどこかで、まわり（半径 rim_tol）に縁取りが 15 画素以上あれば True。"""
+    """線の内側の部分（外縁から遠い方 3割）のどこかで、まわり（半径 rim_tol）に縁取りが 15 画素以上あれば、
+    その点から一番近い縁取りまでの 2点 [(x, y), (x, y)] を返す（割れ全体を描くため）。届かなければ None。"""
     h, w = comp.shape
     ys, xs = np.nonzero(comp)
     d = d_out[ys, xs]
@@ -124,20 +125,24 @@ def _touches_rim(comp, d_out, rim, p):
         y0, y1 = int(max(0, py - r)), int(min(h, py + r + 1))
         gy, gx = np.mgrid[y0:y1, x0:x1]
         disc = np.hypot(gx - px, gy - py) <= r
-        if int((rim[y0:y1, x0:x1] & disc).sum()) >= 15:
-            return True
-    return False
+        near = rim[y0:y1, x0:x1] & disc
+        if int(near.sum()) >= 15:
+            ry, rx = np.nonzero(near)
+            j = int(np.argmin(np.hypot(rx + x0 - px, ry + y0 - py)))
+            return [(int(px), int(py)), (int(rx[j] + x0), int(ry[j] + y0))]
+    return None
 
 
 def _follow_to_rim(comp, ary, d_out, rim, plate, p):
     """線の内側の端（外縁から一番遠い所）から、線の向きに沿って外縁と反対の方へ暗い所をたどり、
-    暗いまま縁取りに着けば True。割れの根元は細く薄くて、暗い線として途切れやすいため。"""
+    暗いまま縁取りに着けば、たどった点の並び [(x, y), ...] を返す（割れ全体を描くため）。着かなければ None。
+    割れの根元は細く薄くて、暗い線として途切れやすいため。"""
     h, w = comp.shape
     ys, xs = np.nonzero(comp)
     d = d_out[ys, xs]
     top = d >= np.percentile(d, 70)                              # 線の内側 3割の点で向きを測る
     if top.sum() < 5:
-        return False
+        return None
     vx, vy, _, _ = cv2.fitLine(np.c_[xs[top], ys[top]].astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).ravel()
     i0 = int(np.argmax(d))
     x, y = float(xs[i0]), float(ys[i0])
@@ -146,6 +151,7 @@ def _follow_to_rim(comp, ary, d_out, rim, plate, p):
         vx, vy = -vx, -vy
     side_n = p["black_follow_side"]
     miss = 0
+    route = [(int(x), int(y))]
     for _ in range(p["black_follow_len"]):
         x, y = x + vx, y + vy
         # 進む向きに垂直に ±side_n px 探し、一番暗い所に寄せる（曲がった割れにも沿う）
@@ -156,9 +162,10 @@ def _follow_to_rim(comp, ary, d_out, rim, plate, p):
                 best_v, best_xy = float(ary[qy, qx]), (qx, qy)
         qx, qy = int(round(best_xy[0])), int(round(best_xy[1]))
         if not (0 <= qx < w and 0 <= qy < h):
-            return False
+            return None
+        route.append((qx, qy))
         if rim[qy, qx] or (0 <= int(y) < h and 0 <= int(x) < w and rim[int(y), int(x)]):
-            return True                                          # 暗い線のまま縁取りに着いた
+            return route                                         # 暗い線のまま縁取りに着いた
         # まわり（横に ±side_n*3 px）と比べて暗いか。根元は全体に明るく写ることがあるので相対で見る
         side = [ary[int(round(y + t * vx)) % h, int(round(x - t * vy)) % w]
                 for t in range(-3 * side_n, 3 * side_n + 1)]
@@ -168,8 +175,8 @@ def _follow_to_rim(comp, ary, d_out, rim, plate, p):
         else:
             miss += 1
             if miss > p["black_follow_gap"]:
-                return False
-    return False
+                return None
+    return None
 
 
 def find_crossing_cracks(ary, binary, mask, roi_lr, gate_x, top_row, p):
@@ -259,8 +266,12 @@ def find_crossing_cracks(ary, binary, mask, roi_lr, gate_x, top_row, p):
         if holes > p["black_hole_ratio"] * comp.sum():
             continue
         # 内側の端が縁取りに届いているか（届いていなければ、暗い所をたどって届くか）
-        if _touches_rim(comp, d_out, rim, p) or _follow_to_rim(comp, ary, d_out, rim, plate, p):
-            crossing += cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+        link = _follow_to_rim(comp, ary, d_out, rim, plate, p) or _touches_rim(comp, d_out, rim, p)   # たどれた方が割れの形に沿う
+        if link:
+            # 割れ全体 = 暗い線 + 縁取りまでのつなぎ（縁のそばの画素は判定で使わないので、描く時に足す）
+            region = comp.astype(np.uint8)
+            cv2.polylines(region, [np.array(link, np.int32)], False, 1, 5)
+            crossing += cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
     return crossing
 
 
