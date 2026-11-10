@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from loguru import logger
 
-# v2: 黒ワレの判定を「割れの定義（U字の内側の縁取りから外縁まで抜けている）」に変えた（black_crack_v2.py）
+# v2: 黒ワレ・明ワレの判定に「割れの定義（U字の内側から外縁まで抜けている）」を使う（black_crack_v2.py）
 from black_crack_v2 import (BLACK_V2_PARAMS, BRIGHT_V2_PARAMS, find_bright_crossing,
                             find_crossing_cracks, make_search_mask)
 

@@ -1,0 +1,155 @@
+--- inspect_crack_orig.py	2026-11-09 06:58:29.752606367 +0000
++++ inspect_crack_v2.py	2026-11-10 01:35:28.105532861 +0000
+@@ -1,6 +1,5 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-# ユーザーから受け取った元の検査スクリプト（比較用。変更しない）
+ 
+ import json
+ import os
+@@ -11,6 +10,10 @@
+ import numpy as np
+ from loguru import logger
+ 
++# v2: 黒ワレ・明ワレの判定に「割れの定義（U字の内側から外縁まで抜けている）」を使う（black_crack_v2.py）
++from black_crack_v2 import (BLACK_V2_PARAMS, BRIGHT_V2_PARAMS, find_bright_crossing,
++                            find_crossing_cracks, make_search_mask)
++
+ def getker(num):
+     """元コードのgetker()相当"""
+     num_h = num // 2
+@@ -56,6 +59,8 @@
+     "th_black_level": 18,
+     "template_threshold": 0.0,
+ }
++DEFAULT_PARAMS.update(BLACK_V2_PARAMS)   # v2: 黒ワレ判定の設定を追加（pos2 も引き継ぐ）
++DEFAULT_PARAMS.update(BRIGHT_V2_PARAMS)  # v2: 明ワレ判定の設定を追加
+ 
+ # pos2 は params_cm.json の camera_params["2"] 相当
+ POS2_PARAMS = dict(
+@@ -239,9 +244,13 @@
+             score = max(score, contour_height)
+             selected_contours.append(contour)
+ 
++        # v2: 白く光る割れ目が ROI の上端から下端まで続いていれば、元の判定に関係なく NG
++        crossing = find_bright_crossing(ary_interest, closed, p)
++        selected_contours += crossing
++
+         return {
+             "score": int(score),
+-            "is_ng": score > p["th_score"],
++            "is_ng": score > p["th_score"] or len(crossing) > 0,
+             "canny": canny,
+             "dilated": dilated,
+             "contours": selected_contours,
+@@ -258,30 +267,18 @@
+         radius,
+     ):
+         p = self.params
++        # v2: 赤い ROI の中だけでなく、カセットの左右の端から端までを探す
++        y0 = max(0, top_lim - radius)
++        cst_left, cst_right, _ = self._find_cassette_limits(ary_gray)
+         ary_interest = ary_gray[
+-            max(0, top_lim - radius):bottom_lim,
+-            left_lim:right_lim,
++            y0:bottom_lim,
++            cst_left:cst_right,
+         ]
+         if ary_interest.size == 0:
+             raise RuntimeError("黒ワレ検出用ROIが空です")
+ 
+-        mask = np.zeros_like(ary_interest)
+-        cv2.circle(
+-            mask,
+-            (cx - left_lim, 0),
+-            int(radius * 1.75),
+-            255,
+-            -1,
+-        )
+-        cv2.circle(
+-            mask,
+-            (cx - left_lim, 0),
+-            radius,
+-            0,
+-            -1,
+-        )
+-        mask[:radius // 2] = 0
+-        mask[:, max(0, cx - left_lim - 250):cx - left_lim + 250] = 0
++        # v2: 探す範囲は長方形（U字の形は写真ごとのブレが大きく当てられないので使わない）
++        mask = make_search_mask(ary_interest.shape, radius, cx - cst_left, top_lim - y0, p)
+ 
+         th_clip = int(np.percentile(
+             ary_gray[top_lim:bottom_lim, left_lim:right_lim],
+@@ -289,11 +286,8 @@
+         ))
+         clipped = ary_interest.clip(0, th_clip)
+ 
+-        closed = cv2.morphologyEx(
+-            clipped,
+-            cv2.MORPH_CLOSE,
+-            getker(11),
+-        )
++        # v2: CLOSE(11) は幅 11px 未満の細い割れ線を埋めて消すので、軽いぼかしだけにする
++        closed = cv2.GaussianBlur(clipped, (3, 3), 0)
+         # 横長に加えて、縦・斜めの黒い割れも拾う(inspect_cm.py と同じ)
+         blackhat = np.max([
+             cv2.morphologyEx(
+@@ -326,13 +320,27 @@
+         score_black = 0 if not heights else int(np.max(heights))
+         logger.info(f"score_black:{score_black}, th:{p['th_score_black']}")
+ 
++        # v2: 判定は「黒い線が縁取りから外縁まで抜けているか」（score_black は参考値として残す）
++        crossing = find_crossing_cracks(
++            ary_interest,
++            binary,
++            mask,
++            (left_lim - cst_left, right_lim - cst_left),
++            cx - cst_left,
++            int(radius * p["black_top_cut"]),
++            p,
++        )
++        logger.info(f"black crossing:{len(crossing)}")
++
+         return {
+             "score_black": score_black,
+-            "is_ng": score_black > p["th_score_black"],
++            "is_ng": len(crossing) > 0,
+             "blackhat": blackhat,
+             "binary": binary,
+             "mask": mask,
+             "contours": contours,
++            "crossing_contours": crossing,      # v2: NG の理由になった線（切り出し画像の座標）
++            "offset": (cst_left, y0),           # v2: 切り出し画像 -> 元画像 の座標のずれ
+         }
+ 
+     def inspect(self, frame, out_frame=None, force=False):
+@@ -409,6 +417,7 @@
+                 bright_result,
+                 max_loc,
+                 is_ng,
++                black_result,
+             )
+ 
+         return info
+@@ -421,6 +430,7 @@
+         bright_result,
+         max_loc,
+         is_ng,
++        black_result=None,
+     ):
+         out_frame[:] = frame
+         left = roi["left_lim"]
+@@ -457,6 +467,13 @@
+                 2,
+             )
+ 
++        # v2: 黒ワレを探した範囲を水色、割れと判定した線をピンクで描く
++        if black_result is not None:
++            ox, oy = black_result["offset"]
++            ys, xs = np.nonzero(black_result["mask"])
++            cv2.rectangle(out_frame, (ox + xs.min(), oy + ys.min()), (ox + xs.max(), oy + ys.max()), (255, 255, 0), 2)
++            cv2.drawContours(out_frame, black_result["crossing_contours"], -1, (255, 0, 255), 2, offset=(ox, oy))
++
+ 
+ class InspectorCrackPos1(BaseCrackInspector):
+     """InspectorCrackPos1の単一画像テスト用クラス"""
