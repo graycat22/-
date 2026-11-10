@@ -460,8 +460,11 @@ class BaseCrackInspector:
         score_black = 0 if not heights else int(np.max(heights))
         logger.info(f"score_black:{score_black}, th:{p['th_score_black']}")
 
+        # v2: 欠け（下が欠けて背景が見えている所）。欠けていたら NG は決まりで、
+        #     明るい背景で明るさの基準がずれるので黒ワレは調べない
+        chip = _find_chip(ary_gray[top_lim:bottom_lim, left_lim:right_lim])
         # v2: 判定は score_black ではなく「縁から外縁まで抜けた黒い線があるか」
-        crossing = _find_black_crossing(
+        crossing = [] if chip.mean() > p["th_chip"] else _find_black_crossing(
             ary_interest, binary, mask,
             (left_lim - cst_left, right_lim - cst_left), radius // 5, p,
         )
@@ -474,6 +477,7 @@ class BaseCrackInspector:
             "mask": mask,
             "contours": contours,
             "crossing": crossing,           # v2: 描画用
+            "chip": chip,                   # v2: 欠け（赤い ROI の座標）
             "offset": (cst_left, y0),       # v2: 描画用
         }
 
@@ -513,10 +517,8 @@ class BaseCrackInspector:
             roi["radius"],
         )
 
-        # v2: 下が大きく欠けていないか
-        chip = _find_chip(ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]])
-        chip_ng = chip.mean() > self.params["th_chip"]
-        black_result["chip"] = cv2.findContours(chip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2] if chip_ng else []
+        chip = black_result["chip"]
+        chip_ng = chip.mean() > self.params["th_chip"]   # v2: 下が大きく欠けていないか
 
         is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng
         info = {
@@ -612,7 +614,9 @@ class BaseCrackInspector:
             ys, xs = np.nonzero(black_result["mask"])
             cv2.rectangle(out_frame, (ox + xs.min(), oy + ys.min()), (ox + xs.max(), oy + ys.max()), (255, 255, 0), 2)
             cv2.drawContours(out_frame, black_result["crossing"], -1, (255, 0, 255), 2, offset=(ox, oy))
-            cv2.drawContours(out_frame, black_result["chip"], -1, (0, 165, 255), 3, offset=(left, top))   # 欠けはオレンジ
+            if black_result["chip"].mean() > self.params["th_chip"]:   # 欠けはオレンジ
+                chip_cs = cv2.findContours(black_result["chip"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+                cv2.drawContours(out_frame, chip_cs, -1, (0, 165, 255), 3, offset=(left, top))
 
 
 class InspectorCrackPos1(BaseCrackInspector):
