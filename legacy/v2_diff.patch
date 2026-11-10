@@ -1,5 +1,5 @@
 --- inspect_crack_orig.py	2026-11-09 06:58:29.752606367 +0000
-+++ inspect_crack_v2.py	2026-11-10 01:53:08.693679347 +0000
++++ inspect_crack_v2.py	2026-11-10 02:03:28.173913053 +0000
 @@ -1,6 +1,5 @@
  #!/usr/bin/env python3
  # -*- coding: utf-8 -*-
@@ -7,7 +7,7 @@
  
  import json
  import os
-@@ -26,6 +25,134 @@
+@@ -26,6 +25,144 @@
      return float(ary[mask > 0].mean())
  
  
@@ -121,6 +121,16 @@
 +    return crossing
 +
 +
++def _find_chip(ary):
++    """欠け: ROI の下端からつながっている、プレートより明るい所（= 欠けて背景が見えている所）"""
++    a = cv2.blur(ary, (7, 7))
++    ref = float(np.median(a[:a.shape[0] // 3]))          # プレートの明るさ（ROI の上 1/3）
++    bright = (a >= ref + 0.5 * (float(np.percentile(a, 99)) - ref)).astype(np.uint8)
++    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
++    _, lab = cv2.connectedComponents(bright)
++    return np.isin(lab, np.unique(lab[-1])[1:]).astype(np.uint8)   # 下端の行に触れているもの
++
++
 +def _find_bright_crossing(ary, closed, p):
 +    """光が漏れて白く光る割れ目が、ROI の上端から下端まで続いていればその輪郭を返す"""
 +    h = ary.shape[0]
@@ -142,7 +152,7 @@
  BLACKHAT_KERNELS = [
      np.ones([1, 51], np.uint8),
      np.ones([51, 1], np.uint8),
-@@ -55,6 +182,11 @@
+@@ -55,6 +192,12 @@
      "th_bright_mean": 135,
      "th_black_level": 18,
      "template_threshold": 0.0,
@@ -151,10 +161,11 @@
 +    "black_rim_tophat": 25,    # 周りよりこれだけ明るい細い線を縁取りとする
 +    "black_rim_len": 200,      # 縁取りとみなす白い線の長さ [px]
 +    "bright_min_width": 25,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
++    "th_chip": 0.03,           # 欠け: 下端からつながる明るい所が ROI のこの割合を超えたら NG
  }
  
  # pos2 は params_cm.json の camera_params["2"] 相当
-@@ -239,9 +371,12 @@
+@@ -239,9 +382,12 @@
              score = max(score, contour_height)
              selected_contours.append(contour)
  
@@ -168,7 +179,7 @@
              "canny": canny,
              "dilated": dilated,
              "contours": selected_contours,
-@@ -258,30 +393,22 @@
+@@ -258,30 +404,22 @@
          radius,
      ):
          p = self.params
@@ -210,7 +221,7 @@
  
          th_clip = int(np.percentile(
              ary_gray[top_lim:bottom_lim, left_lim:right_lim],
-@@ -289,11 +416,7 @@
+@@ -289,11 +427,7 @@
          ))
          clipped = ary_interest.clip(0, th_clip)
  
@@ -223,7 +234,7 @@
          # 横長に加えて、縦・斜めの黒い割れも拾う(inspect_cm.py と同じ)
          blackhat = np.max([
              cv2.morphologyEx(
-@@ -326,13 +449,21 @@
+@@ -326,13 +460,21 @@
          score_black = 0 if not heights else int(np.max(heights))
          logger.info(f"score_black:{score_black}, th:{p['th_score_black']}")
  
@@ -246,7 +257,27 @@
          }
  
      def inspect(self, frame, out_frame=None, force=False):
-@@ -409,6 +540,7 @@
+@@ -371,12 +513,18 @@
+             roi["radius"],
+         )
+ 
+-        is_ng = bright_result["is_ng"] or black_result["is_ng"]
++        # v2: 下が大きく欠けていないか
++        chip = _find_chip(ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]])
++        chip_ng = chip.mean() > self.params["th_chip"]
++        black_result["chip"] = cv2.findContours(chip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2] if chip_ng else []
++
++        is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng
+         info = {
+             "judge": "NG" if is_ng else "OK",
+             "is_ng": bool(is_ng),
+             "score": bright_result["score"],
+             "score_black": black_result["score_black"],
++            "chip_area": round(float(chip.mean()), 3),   # v2: 欠けの面積（ROI に対する割合）
+             "template_score": float(template_score),
+             "template_location": [int(max_loc[0]), int(max_loc[1])],
+             "template_location_relative": [
+@@ -409,6 +557,7 @@
                  bright_result,
                  max_loc,
                  is_ng,
@@ -254,7 +285,7 @@
              )
  
          return info
-@@ -421,6 +553,7 @@
+@@ -421,6 +570,7 @@
          bright_result,
          max_loc,
          is_ng,
@@ -262,7 +293,7 @@
      ):
          out_frame[:] = frame
          left = roi["left_lim"]
-@@ -457,6 +590,12 @@
+@@ -457,6 +607,13 @@
                  2,
              )
  
@@ -271,6 +302,7 @@
 +            ys, xs = np.nonzero(black_result["mask"])
 +            cv2.rectangle(out_frame, (ox + xs.min(), oy + ys.min()), (ox + xs.max(), oy + ys.max()), (255, 255, 0), 2)
 +            cv2.drawContours(out_frame, black_result["crossing"], -1, (255, 0, 255), 2, offset=(ox, oy))
++            cv2.drawContours(out_frame, black_result["chip"], -1, (0, 165, 255), 3, offset=(left, top))   # 欠けはオレンジ
 +
  
  class InspectorCrackPos1(BaseCrackInspector):

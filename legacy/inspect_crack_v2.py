@@ -135,6 +135,16 @@ def _find_black_crossing(ary, binary, mask, roi_lr, top_row, p):
     return crossing
 
 
+def _find_chip(ary):
+    """欠け: ROI の下端からつながっている、プレートより明るい所（= 欠けて背景が見えている所）"""
+    a = cv2.blur(ary, (7, 7))
+    ref = float(np.median(a[:a.shape[0] // 3]))          # プレートの明るさ（ROI の上 1/3）
+    bright = (a >= ref + 0.5 * (float(np.percentile(a, 99)) - ref)).astype(np.uint8)
+    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    _, lab = cv2.connectedComponents(bright)
+    return np.isin(lab, np.unique(lab[-1])[1:]).astype(np.uint8)   # 下端の行に触れているもの
+
+
 def _find_bright_crossing(ary, closed, p):
     """光が漏れて白く光る割れ目が、ROI の上端から下端まで続いていればその輪郭を返す"""
     h = ary.shape[0]
@@ -187,6 +197,7 @@ DEFAULT_PARAMS = {
     "black_rim_tophat": 25,    # 周りよりこれだけ明るい細い線を縁取りとする
     "black_rim_len": 200,      # 縁取りとみなす白い線の長さ [px]
     "bright_min_width": 25,    # 白い割れ目の幅の下限 [px]（白い擦り傷は細い）
+    "th_chip": 0.03,           # 欠け: 下端からつながる明るい所が ROI のこの割合を超えたら NG
 }
 
 # pos2 は params_cm.json の camera_params["2"] 相当
@@ -502,12 +513,18 @@ class BaseCrackInspector:
             roi["radius"],
         )
 
-        is_ng = bright_result["is_ng"] or black_result["is_ng"]
+        # v2: 下が大きく欠けていないか
+        chip = _find_chip(ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]])
+        chip_ng = chip.mean() > self.params["th_chip"]
+        black_result["chip"] = cv2.findContours(chip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2] if chip_ng else []
+
+        is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng
         info = {
             "judge": "NG" if is_ng else "OK",
             "is_ng": bool(is_ng),
             "score": bright_result["score"],
             "score_black": black_result["score_black"],
+            "chip_area": round(float(chip.mean()), 3),   # v2: 欠けの面積（ROI に対する割合）
             "template_score": float(template_score),
             "template_location": [int(max_loc[0]), int(max_loc[1])],
             "template_location_relative": [
@@ -595,6 +612,7 @@ class BaseCrackInspector:
             ys, xs = np.nonzero(black_result["mask"])
             cv2.rectangle(out_frame, (ox + xs.min(), oy + ys.min()), (ox + xs.max(), oy + ys.max()), (255, 255, 0), 2)
             cv2.drawContours(out_frame, black_result["crossing"], -1, (255, 0, 255), 2, offset=(ox, oy))
+            cv2.drawContours(out_frame, black_result["chip"], -1, (0, 165, 255), 3, offset=(left, top))   # 欠けはオレンジ
 
 
 class InspectorCrackPos1(BaseCrackInspector):
