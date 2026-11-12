@@ -1,0 +1,117 @@
+--- inspect_crack_orig.py	2026-11-09 06:58:29.752606367 +0000
++++ inspect_simple.py	2026-11-12 08:48:18.232496154 +0000
+@@ -1,6 +1,8 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-# ユーザーから受け取った元の検査スクリプト（比較用。変更しない）
++# 元の検査スクリプトに、次の 2つの判定だけを足したもの（元の判定はそのまま）
++#   1. 欠け: 下が大きく欠けている
++#   2. 縦の割れ線: 赤い ROI の上の方から下へ長く伸びる細い暗い線（16.png のような細く薄い割れ）
+ 
+ import json
+ import os
+@@ -26,6 +28,52 @@
+     return float(ary[mask > 0].mean())
+ 
+ 
++def _find_chip(ary):
++    """追加: 欠けの領域を返す（1 = 欠け、0 = それ以外）。ary は赤い ROI のグレー画像。
++
++    考え方: 下が欠けると、プレート（黒い樹脂）があるはずの所から背景（明るい）が見える。
++    そこで「プレートより明るく」かつ「ROI の下端からつながっている」所を欠けとする。
++    刻印や傷の白い所は下端につながっていないので数えない。
++    """
++    # 1. 細かいざらつきで白黒が乱れないよう、7x7 で軽くぼかす
++    a = cv2.blur(ary, (7, 7))
++    # 2. プレートの明るさの基準 = ROI の上 1/3 の中央値（欠けは下側にできるので、上側は正常なプレート）
++    ref = float(np.median(a[:a.shape[0] // 3]))
++    # 3. 二値化: プレートの明るさと ROI で一番明るい所（上位 1%）の中間より明るければ「プレートではない」
++    bright = (a >= ref + 0.5 * (float(np.percentile(a, 99)) - ref)).astype(np.uint8)
++    # 4. 5x5 より小さい白い点（ノイズ・小さな反射）は消す
++    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
++    # 5. 白い所を塊ごとに番号付けし、ROI の一番下の行に触れている塊だけを残す
++    _, lab = cv2.connectedComponents(bright)
++    bottom_ids = np.unique(lab[-1])[1:]                   # 一番下の行に出てくる塊の番号（0 = 背景は除く）
++    return np.isin(lab, bottom_ids).astype(np.uint8)
++
++
++def _find_long_line(ary, p):
++    """追加: 赤い ROI の上の方から下へ長く伸びる細い暗い線を探し、一番長いものの高さ（ROI の高さに対する割合）を返す。
++
++    考え方: 元の黒ワレ判定は CLOSE(11) で細い線を埋めてしまい、中央 ±250px も見ていないので、
++    16.png のようなゲート付近を通る細く薄い割れが拾えない。そこで ROI 全体で細い暗い線だけを取り出し、
++    「上の方から始まって、下へ長く伸びている」ものを割れとする。
++    """
++    h = ary.shape[0]
++    # 1. 細かいざらつきを 3x3 で軽くぼかす
++    a = cv2.GaussianBlur(ary, (3, 3), 0)
++    # 2. 周り（line_kernel の円）より暗い細い所を取り出す（ブラックハット）。太い影は消え、細い線だけ残る
++    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (p["line_kernel"], p["line_kernel"]))
++    line = (cv2.morphologyEx(a, cv2.MORPH_BLACKHAT, kern) > p["line_th"]).astype(np.uint8)
++    # 3. 左右の端 15px（縦リブの黒い線）は見ない
++    line[:, :15] = 0
++    line[:, -15:] = 0
++    # 4. 線を塊ごとに分け、上端が ROI の上 line_top 以内から始まる塊のうち、一番縦に長いものを探す
++    n, lab, st, _ = cv2.connectedComponentsWithStats(line)
++    best, best_id = 0.0, 0
++    for i in range(1, n):
++        if st[i, cv2.CC_STAT_TOP] <= p["line_top"] * h and st[i, cv2.CC_STAT_HEIGHT] / h > best:
++            best, best_id = st[i, cv2.CC_STAT_HEIGHT] / h, i
++    return best, (lab == best_id).astype(np.uint8) if best_id else np.zeros_like(line)
++
++
+ BLACKHAT_KERNELS = [
+     np.ones([1, 51], np.uint8),
+     np.ones([51, 1], np.uint8),
+@@ -55,6 +103,11 @@
+     "th_bright_mean": 135,
+     "th_black_level": 18,
+     "template_threshold": 0.0,
++    "th_chip": 0.03,   # 追加: 欠けの面積が赤い ROI の 3% を超えたら NG（OK 品は 1% 以下）
++    "line_kernel": 7,  # 追加: 縦の割れ線 — これより細い暗い線を取り出す [px]
++    "line_th": 8,      # 追加: 縦の割れ線 — 周りよりこれだけ暗ければ線とみなす
++    "line_top": 0.3,   # 追加: 縦の割れ線 — 線の上端が ROI の上からこの割合以内で始まること
++    "th_line": 0.4,    # 追加: 縦の割れ線 — 線の高さが ROI の高さのこの割合を超えたら NG
+ }
+ 
+ # pos2 は params_cm.json の camera_params["2"] 相当
+@@ -371,12 +424,25 @@
+             roi["radius"],
+         )
+ 
+-        is_ng = bright_result["is_ng"] or black_result["is_ng"]
++        # 追加: 下が大きく欠けていないか
++        # 赤い ROI（U字の下のプレート部分）を切り出して欠けの領域を求める
++        chip = _find_chip(ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]])
++        # 欠けの面積 = 欠けの画素数 ÷ ROI の画素数（chip は 0/1 なので平均がそのまま割合）
++        chip_ng = chip.mean() > self.params["th_chip"]
++
++        # 追加: 上の方から下へ長く伸びる細い暗い線（細く薄い割れ）
++        line_h, line = _find_long_line(
++            ary_gray[roi["top_lim"]:roi["bottom_lim"], roi["left_lim"]:roi["right_lim"]], self.params)
++        line_ng = line_h > self.params["th_line"]
++
++        is_ng = bright_result["is_ng"] or black_result["is_ng"] or chip_ng or line_ng   # 変更: 欠け・縦の割れ線も NG に含める
+         info = {
+             "judge": "NG" if is_ng else "OK",
+             "is_ng": bool(is_ng),
+             "score": bright_result["score"],
+             "score_black": black_result["score_black"],
++            "chip_area": round(float(chip.mean()), 3),   # 追加: 欠けの面積（ROI に対する割合）
++            "line_height": round(float(line_h), 3),      # 追加: 縦の割れ線の高さ（ROI の高さに対する割合）
+             "template_score": float(template_score),
+             "template_location": [int(max_loc[0]), int(max_loc[1])],
+             "template_location_relative": [
+@@ -410,6 +476,12 @@
+                 max_loc,
+                 is_ng,
+             )
++            if chip_ng:   # 追加: 欠けの輪郭をオレンジで描く（ROI の座標なので ROI の左上の分ずらす）
++                cs = cv2.findContours(chip, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
++                cv2.drawContours(out_frame, cs, -1, (0, 165, 255), 3, offset=(roi["left_lim"], roi["top_lim"]))
++            if line_ng:   # 追加: 縦の割れ線を黄色で描く
++                cs = cv2.findContours(line, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
++                cv2.drawContours(out_frame, cs, -1, (0, 255, 255), 2, offset=(roi["left_lim"], roi["top_lim"]))
+ 
+         return info
+ 
