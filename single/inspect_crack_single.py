@@ -7,9 +7,9 @@ import traceback
 
 import click
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 from loguru import logger
-import matplotlib.pyplot as plt
 
 def getker(num):
     """元コードのgetker()相当"""
@@ -52,7 +52,7 @@ DEFAULT_PARAMS = {
 
 
 class BaseCrackInspector:
-    """InspectorCrackPos1/2のinspect処理をテスト用に切り出したもの"""
+    """InspectorCrackPos1/2のinspect処理をテストする最小基底クラス"""
 
     def __init__(self, params, template_path):
         self.params = params
