@@ -532,7 +532,7 @@ def create_inspector(position, template_path, params):
     "position",
     type=click.Choice(["pos1", "pos2"]),
 )
-@click.argument("image_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("image_path", type=click.Path(exists=True))   # 変更: フォルダも指定できる
 @click.option("--template", "template_path", default=None)
 @click.option("--save-debug", "save_debug", default=None)
 @click.option(
@@ -542,7 +542,9 @@ def create_inspector(position, template_path, params):
     show_default=True,
 )
 def main(position, image_path, template_path, save_debug, template_threshold):
-    """InspectorCrackPos1/Pos2の画像1枚検査"""
+    """InspectorCrackPos1/Pos2の画像1枚検査（フォルダを指定すると中の画像を全部検査）"""
+    if os.path.isdir(image_path):   # 追加: フォルダ指定
+        return inspect_folder(position, image_path, template_path, save_debug, template_threshold)
     frame = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if frame is None:
         raise click.ClickException(
@@ -588,6 +590,42 @@ def main(position, image_path, template_path, save_debug, template_threshold):
                 "デバッグ画像を保存できません: {}".format(save_debug)
             )
         click.echo("debug image: {}".format(save_debug))
+
+
+def inspect_folder(position, folder, template_path, save_dir, template_threshold):
+    """追加: フォルダの画像を全部検査し、1枚 1行で結果を出す。--save-debug にはフォルダを指定する"""
+    plt.show = lambda *a, **k: None   # 明ワレの途中の plt.show() で 1枚ごとに止まらないようにする
+    logger.remove()                   # 1枚ごとのログは出さない
+    params = DEFAULT_PARAMS.copy()
+    params["template_threshold"] = template_threshold
+    if template_path is None:
+        template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     {"pos1": "template_table1.png", "pos2": "template_table2.png"}[position])
+    inspector = create_inspector(position, template_path, params)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    files = sorted(f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")))
+    n_ng = 0
+    for name in files:
+        # 日本語を含むパスでも読めるように読み込む（cv2.imread は Windows で日本語パスを読めない）
+        frame = cv2.imdecode(np.fromfile(os.path.join(folder, name), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            click.echo("{}\t読み込めません".format(name))
+            continue
+        debug_image = np.zeros_like(frame) if save_dir else None
+        try:
+            info = inspector.inspect(frame, out_frame=debug_image, force=True)
+        except Exception as exc:      # 1枚の失敗で止めない
+            click.echo("{}\tERROR {}".format(name, exc))
+            continue
+        n_ng += info["is_ng"]
+        click.echo("{}\t{}\tscore={}\tscore_black={}\t欠け={}\tひび割れ={}".format(
+            name, info["judge"], info["score"], info["score_black"], info["chip_area"], info["line_height"]))
+        if save_dir:
+            ok, buf = cv2.imencode(".jpg", debug_image)
+            buf.tofile(os.path.join(save_dir, os.path.splitext(name)[0] + ".jpg"))
+    click.echo("{} 枚中 NG {} 枚".format(len(files), n_ng))
 
 
 if __name__ == "__main__":
