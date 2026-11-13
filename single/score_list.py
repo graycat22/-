@@ -10,6 +10,7 @@
   python score_list.py C:\\画像\\detected
   python score_list.py --pos pos2 C:\\画像\\pos2_detected
   python score_list.py --pos pos1 --debug C:\\画像\\pos1_ng      （デバッグ画像も保存する）
+  python score_list.py --new --debug C:\\画像\\pos1_ng            （新しい方 inspect_crack_single_new.py で検査）
 
 出力: score_list.py と同じフォルダに「<画像フォルダ名>_<pos>.csv」（--debug なら「<画像フォルダ名>_<pos>_debug」フォルダも）
 """
@@ -22,7 +23,8 @@ import cv2
 import numpy as np
 from loguru import logger
 
-import inspect_crack_single as S
+import inspect_crack_single
+import inspect_crack_single_new
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,16 +45,19 @@ def imwrite(path, img):
 @click.option("--pos", "position", type=click.Choice(["pos1", "pos2"]), default="pos1", show_default=True)
 @click.option("--out", default=None, help="CSV の保存先（省略時は <画像フォルダ名>_<pos>.csv）")
 @click.option("--debug", is_flag=True, help="デバッグ画像（ROI と検出した輪郭）も保存する")
+@click.option("--new", "use_new", is_flag=True, help="新しい方（欠け・ひび割れの判定を追加した inspect_crack_single_new.py）で検査する")
 @click.argument("folder", type=click.Path(exists=True, file_okay=False))
-def main(position, out, debug, folder):
+def main(position, out, debug, use_new, folder):
+    S = inspect_crack_single_new if use_new else inspect_crack_single
+    tag = position + ("_new" if use_new else "")
     logger.remove()                                   # 1枚ごとのログは出さない
     S.plt.show = lambda *a, **k: None                 # 明ワレの途中にある plt.show() で止まらないようにする
     template = os.path.join(HERE, {"pos1": "template_table1.png", "pos2": "template_table2.png"}[position])
     insp = S.create_inspector(position, template, S.DEFAULT_PARAMS.copy())
 
     name = os.path.basename(os.path.normpath(folder))
-    out = out or os.path.join(HERE, "{}_{}.csv".format(name, position))
-    debug_dir = os.path.join(HERE, "{}_{}_debug".format(name, position)) if debug else None
+    out = out or os.path.join(HERE, "{}_{}.csv".format(name, tag))
+    debug_dir = os.path.join(HERE, "{}_{}_debug".format(name, tag)) if debug else None
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
 
@@ -61,7 +66,7 @@ def main(position, out, debug, folder):
     n_ng = 0
     with open(out, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["画像", "判定", "score(明ワレ)", "score_black(黒ワレ)", "template_score"])
+        w.writerow(["画像", "判定", "score(明ワレ)", "score_black(黒ワレ)", "template_score", "欠け面積", "ひび割れ高さ"])
         for f in files:
             frame = imread(f)
             if frame is None:
@@ -75,7 +80,7 @@ def main(position, out, debug, folder):
                 continue
             n_ng += info["is_ng"]
             w.writerow([os.path.basename(f), info["judge"], info["score"], info["score_black"],
-                        round(info["template_score"], 3)])
+                        round(info["template_score"], 3), info.get("chip_area", ""), info.get("line_height", "")])
             if debug_dir:
                 imwrite(os.path.join(debug_dir, os.path.splitext(os.path.basename(f))[0] + ".jpg"), dbg)
     print("{} 枚中 NG {} 枚 -> {}".format(len(files), n_ng, out))
